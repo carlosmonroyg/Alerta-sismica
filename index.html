@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="es-CO">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b1120">
+<meta name="description" content="Alerta Sísmica Colombia — monitoreo de sismos en tiempo real para Villavicencio, Bogotá y todo el país">
+<link rel="manifest" href="manifest.json">
+<title>Alerta Sísmica CO</title>
+<style>
+:root{
+  --bg:#0b1120; --panel:#111a2e; --panel2:#18233c;
+  --line:#223050; --text:#e8eefc; --muted:#8fa3c8;
+  --safe:#22c55e; --watch:#f59e0b; --danger:#ef4444;
+  --accent:#38bdf8; --mag-low:#4ade80; --mag-mid:#fbbf24; --mag-high:#f87171;
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  overflow:hidden; user-select:none;
+  padding-top:env(safe-area-inset-top);
+}
+#app{display:flex;flex-direction:column;height:100dvh;max-width:520px;margin:0 auto}
+
+/* ---------- Header ---------- */
+header{
+  display:flex;align-items:center;gap:10px;padding:14px 16px 10px;
+}
+.logo{
+  width:38px;height:38px;border-radius:12px;flex:0 0 auto;
+  background:linear-gradient(135deg,#0ea5e9,#6366f1);
+  display:grid;place-items:center;font-size:20px;
+  box-shadow:0 4px 14px rgba(56,189,248,.35);
+}
+header h1{font-size:17px;font-weight:700;letter-spacing:.3px}
+header .sub{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--safe);animation:pulse 2s infinite}
+.dot.err{background:var(--danger);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+#btnCity{
+  margin-left:auto;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+  border-radius:10px;padding:8px 12px;font-size:12px;font-weight:600;cursor:pointer;
+}
+
+/* ---------- Risk banner ---------- */
+#riskCard{
+  margin:4px 16px 10px;border-radius:16px;padding:14px 16px;
+  display:flex;align-items:center;gap:14px;
+  background:var(--panel);border:1px solid var(--line);
+  transition:background .5s,border-color .5s;
+}
+#riskCard.safe{border-color:rgba(34,197,94,.4);background:linear-gradient(135deg,rgba(34,197,94,.12),var(--panel))}
+#riskCard.watch{border-color:rgba(245,158,11,.5);background:linear-gradient(135deg,rgba(245,158,11,.15),var(--panel))}
+#riskCard.danger{border-color:rgba(239,68,68,.6);background:linear-gradient(135deg,rgba(239,68,68,.2),var(--panel));animation:riskFlash 1s infinite}
+@keyframes riskFlash{50%{border-color:#ef4444}}
+#riskIcon{font-size:30px}
+#riskTitle{font-size:15px;font-weight:800;letter-spacing:.5px}
+#riskDetail{font-size:12px;color:var(--muted);margin-top:2px;line-height:1.35}
+
+/* ---------- Views ---------- */
+main{flex:1;overflow-y:auto;overscroll-behavior:contain;padding-bottom:8px}
+.view{display:none;padding:0 16px}
+.view.active{display:block}
+h2.section{font-size:13px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:1px;margin:12px 0 8px}
+
+/* ---------- Radar ---------- */
+#radarWrap{position:relative;width:100%;aspect-ratio:1;max-height:52vh;margin:0 auto}
+#radar{width:100%;height:100%;display:block;touch-action:manipulation}
+#radarHint{text-align:center;font-size:11px;color:var(--muted);margin-top:4px}
+.radar-legend{display:flex;justify-content:center;gap:14px;margin-top:8px;font-size:11px;color:var(--muted)}
+.radar-legend span::before{content:"●";margin-right:4px}
+.lg-low::before{color:var(--mag-low)} .lg-mid::before{color:var(--mag-mid)} .lg-high::before{color:var(--mag-high)}
+#quakeInfo{
+  margin-top:10px;background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:12px 14px;font-size:13px;display:none;line-height:1.5;
+}
+#quakeInfo.show{display:block}
+
+/* ---------- Quake list ---------- */
+.quake{
+  display:flex;align-items:center;gap:12px;background:var(--panel);
+  border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:8px;
+  cursor:pointer;transition:transform .1s;
+}
+.quake:active{transform:scale(.98)}
+.magBadge{
+  width:48px;height:48px;border-radius:12px;flex:0 0 auto;display:grid;place-items:center;
+  font-weight:800;font-size:17px;color:#08101f;
+}
+.quake .place{font-size:13.5px;font-weight:600;line-height:1.3}
+.quake .meta{font-size:11.5px;color:var(--muted);margin-top:3px}
+.quake .dist{margin-left:auto;text-align:right;flex:0 0 auto}
+.quake .dist b{font-size:14px}
+.quake .dist small{display:block;color:var(--muted);font-size:10.5px}
+.empty{color:var(--muted);text-align:center;padding:30px 10px;font-size:13px;line-height:1.6}
+
+/* ---------- Seismometer ---------- */
+#seismoCanvas{width:100%;height:180px;background:var(--panel);border:1px solid var(--line);border-radius:14px;display:block}
+#seismoStatus{
+  margin:10px 0;padding:12px 14px;border-radius:14px;background:var(--panel);
+  border:1px solid var(--line);font-size:13px;line-height:1.5;
+}
+#seismoStatus b{font-size:15px}
+.bigBtn{
+  width:100%;padding:14px;border-radius:14px;border:none;font-size:15px;font-weight:700;
+  background:linear-gradient(135deg,#0ea5e9,#6366f1);color:#fff;cursor:pointer;margin-top:6px;
+}
+.bigBtn.off{background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+.gauge{display:flex;gap:8px;margin-top:10px}
+.gauge .cell{
+  flex:1;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:10px;text-align:center;
+}
+.gauge .cell b{font-size:16px;display:block}
+.gauge .cell small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+
+/* ---------- Guide ---------- */
+.guide-card{
+  background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:14px;margin-bottom:10px;font-size:13.5px;line-height:1.6;
+}
+.guide-card h3{font-size:14px;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.guide-card ul{padding-left:18px}
+.guide-card li{margin-bottom:4px}
+.guide-card.hero{
+  background:linear-gradient(135deg,rgba(56,189,248,.15),var(--panel));
+  border-color:rgba(56,189,248,.4);text-align:center;
+}
+.guide-card.hero .big{font-size:22px;font-weight:800;margin:4px 0}
+
+/* ---------- Settings row ---------- */
+.setting{
+  display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;padding:12px 14px;margin-bottom:8px;font-size:13.5px;
+}
+.setting select,.setting input[type=range]{margin-left:auto}
+select{
+  background:var(--panel2);color:var(--text);border:1px solid var(--line);
+  border-radius:8px;padding:6px 8px;font-size:13px;
+}
+
+/* ---------- Tabs ---------- */
+nav{
+  display:flex;border-top:1px solid var(--line);background:rgba(11,17,32,.95);
+  backdrop-filter:blur(10px);padding-bottom:env(safe-area-inset-bottom);
+}
+nav button{
+  flex:1;background:none;border:none;color:var(--muted);padding:10px 0 8px;
+  font-size:10.5px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;
+}
+nav button .ico{font-size:20px;line-height:1}
+nav button.active{color:var(--accent)}
+
+/* ---------- ALERT OVERLAY ---------- */
+#alertOverlay{
+  position:fixed;inset:0;z-index:100;display:none;flex-direction:column;
+  align-items:center;justify-content:center;text-align:center;padding:24px;
+  background:radial-gradient(circle at 50% 30%,#7f1d1d,#450a0a 70%,#1c0505);
+}
+#alertOverlay.show{display:flex;animation:alertBg .6s infinite alternate}
+@keyframes alertBg{from{filter:brightness(1)}to{filter:brightness(1.25)}}
+#alertOverlay .icon{font-size:72px;animation:shakeIco .4s infinite}
+@keyframes shakeIco{0%,100%{transform:translateX(0) rotate(0)}25%{transform:translateX(-6px) rotate(-4deg)}75%{transform:translateX(6px) rotate(4deg)}}
+#alertOverlay h2{font-size:30px;font-weight:900;letter-spacing:2px;margin:10px 0;color:#fff}
+#alertOverlay p{font-size:16px;color:#fecaca;line-height:1.6;max-width:340px}
+#alertOverlay .steps{
+  margin:18px 0;font-size:20px;font-weight:800;color:#fff;line-height:2;
+}
+#alertOverlay button{
+  margin-top:10px;padding:14px 34px;border-radius:99px;border:2px solid #fff;
+  background:transparent;color:#fff;font-size:15px;font-weight:700;cursor:pointer;
+}
+/* toast */
+#toast{
+  position:fixed;left:50%;bottom:90px;transform:translateX(-50%) translateY(20px);
+  background:var(--panel2);border:1px solid var(--line);color:var(--text);
+  padding:10px 18px;border-radius:99px;font-size:13px;opacity:0;transition:.3s;z-index:90;
+  pointer-events:none;white-space:nowrap;max-width:92vw;overflow:hidden;text-overflow:ellipsis;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="logo">🌎</div>
+    <div>
+      <h1>Alerta Sísmica</h1>
+      <div class="sub"><span class="dot" id="statusDot"></span><span id="statusTxt">Conectando…</span></div>
+    </div>
+    <button id="btnCity">📍 Bogotá</button>
+  </header>
+
+  <div id="riskCard" class="safe">
+    <div id="riskIcon">🛡️</div>
+    <div>
+      <div id="riskTitle">EVALUANDO…</div>
+      <div id="riskDetail">Obteniendo datos sísmicos de tu zona…</div>
+    </div>
+  </div>
+
+  <main>
+    <!-- RADAR -->
+    <section class="view active" id="view-radar">
+      <div id="radarWrap"><canvas id="radar"></canvas></div>
+      <div class="radar-legend">
+        <span class="lg-low">M &lt; 4</span><span class="lg-mid">M 4–5.5</span><span class="lg-high">M ≥ 5.5</span>
+      </div>
+      <div id="radarHint">Toca un punto del radar para ver detalles · Tú estás en el centro</div>
+      <div id="quakeInfo"></div>
+    </section>
+
+    <!-- LIST -->
+    <section class="view" id="view-list">
+      <h2 class="section">Sismos recientes cerca de ti (últimos 7 días)</h2>
+      <div id="quakeList"><div class="empty">Cargando sismos…</div></div>
+    </section>
+
+    <!-- SEISMOMETER -->
+    <section class="view" id="view-seismo">
+      <h2 class="section">Sismógrafo — sensores de tu teléfono</h2>
+      <canvas id="seismoCanvas"></canvas>
+      <div class="gauge">
+        <div class="cell"><b id="gNow">0.00</b><small>Vibración m/s²</small></div>
+        <div class="cell"><b id="gPeak">0.00</b><small>Pico sesión</small></div>
+        <div class="cell"><b id="gState">—</b><small>Estado</small></div>
+      </div>
+      <div id="seismoStatus">
+        Apoya el teléfono sobre una mesa o el suelo y activa el sensor.
+        Si el acelerómetro detecta una vibración fuerte y sostenida —como la onda de un sismo— sonará la alarma.
+        Así funciona también la red de detección de Google en Android: millones de teléfonos actuando como mini-sismógrafos.
+      </div>
+      <button class="bigBtn" id="btnSeismo">▶️ Activar sismógrafo</button>
+    </section>
+
+    <!-- GUIDE -->
+    <section class="view" id="view-guide">
+      <div class="guide-card hero">
+        <div>Si la tierra tiembla, recuerda:</div>
+        <div class="big">🧎 AGÁCHATE · 🛡️ CÚBRETE · ✊ SUJÉTATE</div>
+        <div style="color:var(--muted);font-size:12px">La mayoría de las lesiones ocurren por objetos que caen, no por el derrumbe.</div>
+      </div>
+      <div class="guide-card">
+        <h3>🎒 ANTES — prepárate hoy</h3>
+        <ul>
+          <li>Arma un <b>kit de emergencia</b>: agua (3 días), linterna, pito, radio, botiquín, copia de documentos, pila externa.</li>
+          <li>Define con tu familia un <b>punto de encuentro</b> y un contacto fuera de la ciudad.</li>
+          <li>Identifica en casa las <b>zonas seguras</b> (bajo mesas firmes, junto a columnas) y las peligrosas (ventanas, estantes, fachadas).</li>
+          <li>Asegura a la pared muebles altos y el calentador de agua.</li>
+        </ul>
+      </div>
+      <div class="guide-card">
+        <h3>⚡ DURANTE — los primeros 60 segundos</h3>
+        <ul>
+          <li><b>Adentro:</b> agáchate, cúbrete bajo una mesa firme y sujétate. NO corras a las escaleras ni uses el ascensor.</li>
+          <li><b>Afuera:</b> aléjate de edificios, postes, cables y vidrios. Zonas abiertas.</li>
+          <li><b>En carro:</b> detente en un lugar seguro, lejos de puentes y taludes (clave en la vía Bogotá–Villavicencio).</li>
+          <li>Si estás en zona de ladera, atento a <b>deslizamientos</b> después del sismo.</li>
+        </ul>
+      </div>
+      <div class="guide-card">
+        <h3>🩹 DESPUÉS — evita la segunda tragedia</h3>
+        <ul>
+          <li>Espera <b>réplicas</b>: pueden derribar estructuras ya dañadas.</li>
+          <li>Corta gas y electricidad si hueles gas o hay daños. No enciendas fósforos.</li>
+          <li>Evacúa por escaleras, con zapatos. Revisa grietas antes de reingresar.</li>
+          <li>Usa mensajes de texto, no llamadas, para no saturar la red.</li>
+          <li><b>Líneas en Colombia:</b> Emergencias <b>123</b> · Cruz Roja <b>132</b> · Defensa Civil <b>144</b>.</li>
+        </ul>
+      </div>
+      <div class="guide-card">
+        <h3>⚙️ Ajustes de la app</h3>
+        <div class="setting">🔍 Radio de búsqueda
+          <select id="setRadius">
+            <option value="300">300 km</option>
+            <option value="500" selected>500 km</option>
+            <option value="1000">1000 km</option>
+            <option value="2000">2000 km</option>
+          </select>
+        </div>
+        <div class="setting">📏 Magnitud mínima
+          <select id="setMinMag">
+            <option value="2">M 2.0</option>
+            <option value="2.5" selected>M 2.5</option>
+            <option value="3.5">M 3.5</option>
+            <option value="4.5">M 4.5</option>
+          </select>
+        </div>
+        <button class="bigBtn" id="btnNotif">🔔 Activar notificaciones</button>
+        <p style="font-size:11px;color:var(--muted);margin-top:10px;line-height:1.5">
+          Datos sísmicos: USGS (Servicio Geológico de EE.UU.), actualizados cada 60 s.
+          Fuente oficial en Colombia: Servicio Geológico Colombiano — sgc.gov.co.
+          Esta app es una herramienta comunitaria de apoyo y no reemplaza los canales oficiales.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <nav>
+    <button class="active" data-view="radar"><span class="ico">📡</span>Radar</button>
+    <button data-view="list"><span class="ico">📋</span>Sismos</button>
+    <button data-view="seismo"><span class="ico">📈</span>Sensor</button>
+    <button data-view="guide"><span class="ico">🛟</span>Guía</button>
+  </nav>
+</div>
+
+<!-- FULL SCREEN ALERT -->
+<div id="alertOverlay">
+  <div class="icon">🚨</div>
+  <h2 id="alertTitle">¡SISMO DETECTADO!</h2>
+  <p id="alertMsg"></p>
+  <div class="steps">🧎 AGÁCHATE<br>🛡️ CÚBRETE<br>✊ SUJÉTATE</div>
+  <button id="alertDismiss">Estoy a salvo</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ================= CONFIG / STATE ================= */
+const CITIES = [
+  {name:"Bogotá",     lat:4.7110,  lon:-74.0721},
+  {name:"Villavicencio", lat:4.1420, lon:-73.6266},
+  {name:"Mi ubicación GPS", gps:true},
+];
+const S = {
+  lat:4.7110, lon:-74.0721, cityName:"Bogotá", cityIdx:0,
+  radiusKm:500, minMag:2.5,
+  quakes:[], selectedQuake:null,
+  knownIds:new Set(), firstLoad:true,
+  risk:"safe",
+  seismoOn:false, seismoBuf:[], seismoPeak:0, baseline:null, triggerCount:0,
+  alertActive:false, audioCtx:null,
+};
+
+/* ================= UTIL ================= */
+const $=id=>document.getElementById(id);
+function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove("show"),3200);}
+function haversine(la1,lo1,la2,lo2){
+  const R=6371,d=Math.PI/180;
+  const a=Math.sin((la2-la1)*d/2)**2+Math.cos(la1*d)*Math.cos(la2*d)*Math.sin((lo2-lo1)*d/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+function bearing(la1,lo1,la2,lo2){
+  const d=Math.PI/180;
+  const y=Math.sin((lo2-lo1)*d)*Math.cos(la2*d);
+  const x=Math.cos(la1*d)*Math.sin(la2*d)-Math.sin(la1*d)*Math.cos(la2*d)*Math.cos((lo2-lo1)*d);
+  return Math.atan2(y,x); // rad, 0 = north
+}
+function timeAgo(t){
+  const s=(Date.now()-t)/1000;
+  if(s<60)return"hace segundos";
+  if(s<3600)return`hace ${Math.floor(s/60)} min`;
+  if(s<86400)return`hace ${Math.floor(s/3600)} h`;
+  return`hace ${Math.floor(s/86400)} día${s>=172800?"s":""}`;
+}
+function magColor(m){return m>=5.5?"#f87171":m>=4?"#fbbf24":"#4ade80";}
+/* Estimated Mercalli-like intensity at user's location (simple attenuation) */
+function feltIntensity(mag,distKm){
+  return 1.5*mag - 3.0*Math.log10(Math.max(distKm,5)+10) + 3.0;
+}
+
+/* ================= DATA (USGS) ================= */
+async function fetchQuakes(){
+  const start=new Date(Date.now()-7*86400e3).toISOString();
+  const url=`https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude=${S.lat}&longitude=${S.lon}&maxradiuskm=${S.radiusKm}&minmagnitude=${S.minMag}&orderby=time&limit=120&starttime=${start}`;
+  try{
+    const r=await fetch(url);
+    if(!r.ok)throw new Error(r.status);
+    const j=await r.json();
+    S.quakes=j.features.map(f=>{
+      const [lon,lat,depth]=f.geometry.coordinates;
+      const dist=haversine(S.lat,S.lon,lat,lon);
+      return{
+        id:f.id, mag:f.properties.mag||0, place:f.properties.place||"Ubicación desconocida",
+        time:f.properties.time, lat,lon, depth:depth||0, dist,
+        brg:bearing(S.lat,S.lon,lat,lon),
+        felt:feltIntensity(f.properties.mag||0,dist),
+      };
+    });
+    $("statusDot").classList.remove("err");
+    $("statusTxt").textContent=`En vivo · ${S.quakes.length} sismos en ${S.radiusKm} km · ${new Date().toLocaleTimeString("es-CO",{hour:"2-digit",minute:"2-digit"})}`;
+    detectNewQuakes();
+    assessRisk();
+    renderList();
+  }catch(e){
+    $("statusDot").classList.add("err");
+    $("statusTxt").textContent="Sin conexión con USGS — reintentando…";
+  }
+}
+
+function detectNewQuakes(){
+  for(const q of S.quakes){
+    if(S.knownIds.has(q.id))continue;
+    S.knownIds.add(q.id);
+    if(S.firstLoad)continue;
+    const ageMin=(Date.now()-q.time)/60000;
+    if(ageMin>90)continue; // only genuinely fresh events
+    if(q.felt>=4.5 || (q.mag>=5 && q.dist<300)){
+      fireAlert(`Sismo M${q.mag.toFixed(1)} — ${q.place}`,
+        `A ${Math.round(q.dist)} km de ti, ${timeAgo(q.time)}. Podrías sentirlo o recibir réplicas.`);
+    }else if(q.felt>=2.5){
+      notify(`Sismo M${q.mag.toFixed(1)} cerca de ti`,`${q.place} · a ${Math.round(q.dist)} km · ${timeAgo(q.time)}`);
+      toast(`🌐 Nuevo sismo M${q.mag.toFixed(1)} a ${Math.round(q.dist)} km`);
+    }
+  }
+  S.firstLoad=false;
+}
+
+/* ================= RISK ================= */
+function assessRisk(){
+  const now=Date.now();
+  let risk="safe",headline=null;
+  for(const q of S.quakes){
+    const ageH=(now-q.time)/3600e3;
+    if(ageH<6 && q.felt>=4.5){risk="danger";headline=q;break;}
+    if(ageH<24 && (q.felt>=3 || (q.mag>=4.5&&q.dist<200))){if(risk!=="danger"){risk="watch";headline=headline||q;}}
+  }
+  S.risk=risk;
+  const card=$("riskCard");card.className=risk;
+  if(risk==="danger"){
+    $("riskIcon").textContent="🚨";
+    $("riskTitle").textContent="PELIGRO — ACTIVIDAD FUERTE CERCANA";
+    $("riskDetail").textContent=`M${headline.mag.toFixed(1)} ${headline.place}, a ${Math.round(headline.dist)} km, ${timeAgo(headline.time)}. Atento a réplicas: revisa la pestaña Guía.`;
+  }else if(risk==="watch"){
+    $("riskIcon").textContent="⚠️";
+    $("riskTitle").textContent="PRECAUCIÓN — ACTIVIDAD RECIENTE";
+    $("riskDetail").textContent=`M${headline.mag.toFixed(1)} ${headline.place}, a ${Math.round(headline.dist)} km, ${timeAgo(headline.time)}. Sin peligro inminente, mantente informado.`;
+  }else{
+    $("riskIcon").textContent="🛡️";
+    $("riskTitle").textContent="SIN PELIGRO INMINENTE";
+    const n=S.quakes.length;
+    $("riskDetail").textContent=n?`Actividad normal: ${n} sismo${n>1?"s":""} leves en ${S.radiusKm} km esta semana. Ninguno representa riesgo para ${S.cityName}.`:`Sin sismos registrados en ${S.radiusKm} km esta semana cerca de ${S.cityName}.`;
+  }
+}
+
+/* ================= RADAR ================= */
+const radar=$("radar"),rctx=radar.getContext("2d");
+let sweep=0,blips=[]; // blips: screen positions for hit-testing
+function sizeRadar(){
+  const w=radar.parentElement.clientWidth;
+  radar.width=w*devicePixelRatio;radar.height=w*devicePixelRatio;
+  rctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+function drawRadar(){
+  const w=radar.width/devicePixelRatio,c=w/2,maxR=c-14;
+  rctx.clearRect(0,0,w,w);
+  // rings
+  const rings=4;
+  for(let i=1;i<=rings;i++){
+    rctx.beginPath();rctx.arc(c,c,maxR*i/rings,0,7);
+    rctx.strokeStyle="rgba(56,189,248,.18)";rctx.lineWidth=1;rctx.stroke();
+    rctx.fillStyle="rgba(143,163,200,.7)";rctx.font="10px system-ui";rctx.textAlign="center";
+    rctx.fillText(`${Math.round(S.radiusKm*i/rings)} km`,c,c-maxR*i/rings+11);
+  }
+  // cross
+  rctx.strokeStyle="rgba(56,189,248,.10)";
+  rctx.beginPath();rctx.moveTo(c-maxR,c);rctx.lineTo(c+maxR,c);rctx.moveTo(c,c-maxR);rctx.lineTo(c,c+maxR);rctx.stroke();
+  rctx.fillStyle="rgba(143,163,200,.9)";rctx.font="bold 11px system-ui";
+  rctx.fillText("N",c,c-maxR+2);
+  // sweep
+  sweep+=0.016;
+  const g=rctx.createConicGradient? (()=>{const gg=rctx.createConicGradient(sweep,c,c);gg.addColorStop(0,"rgba(56,189,248,.28)");gg.addColorStop(.12,"rgba(56,189,248,0)");gg.addColorStop(1,"rgba(56,189,248,0)");return gg;})():null;
+  if(g){rctx.beginPath();rctx.moveTo(c,c);rctx.arc(c,c,maxR,sweep,sweep+ .5);rctx.closePath();rctx.fillStyle=g;rctx.fill();}
+  // blips
+  blips=[];
+  const now=Date.now();
+  for(const q of S.quakes){
+    if(q.dist>S.radiusKm)continue;
+    const r=q.dist/S.radiusKm*maxR;
+    const x=c+Math.sin(q.brg)*r, y=c-Math.cos(q.brg)*r;
+    const size=4+q.mag*1.9;
+    const ageH=(now-q.time)/3600e3;
+    const alpha=ageH<1?1:ageH<24?0.85:0.45;
+    // pulse for recent
+    if(ageH<3){
+      const p=(now/900%1);
+      rctx.beginPath();rctx.arc(x,y,size+p*16,0,7);
+      rctx.strokeStyle=magColor(q.mag)+Math.floor((1-p)*70).toString(16).padStart(2,"0");
+      rctx.lineWidth=2;rctx.stroke();
+    }
+    rctx.globalAlpha=alpha;
+    rctx.beginPath();rctx.arc(x,y,size,0,7);
+    rctx.fillStyle=magColor(q.mag);rctx.fill();
+    if(S.selectedQuake===q.id){rctx.strokeStyle="#fff";rctx.lineWidth=2;rctx.stroke();}
+    rctx.globalAlpha=1;
+    blips.push({x,y,r:Math.max(size,14),q});
+  }
+  // user (center)
+  rctx.beginPath();rctx.arc(c,c,7,0,7);rctx.fillStyle="#38bdf8";rctx.fill();
+  rctx.beginPath();rctx.arc(c,c,7+(now/1200%1)*14,0,7);
+  rctx.strokeStyle=`rgba(56,189,248,${1-(now/1200%1)})`;rctx.lineWidth=2;rctx.stroke();
+  requestAnimationFrame(drawRadar);
+}
+radar.addEventListener("click",e=>{
+  const rect=radar.getBoundingClientRect();
+  const x=e.clientX-rect.left,y=e.clientY-rect.top;
+  let best=null,bd=1e9;
+  for(const b of blips){const d=Math.hypot(b.x-x,b.y-y);if(d<b.r+8&&d<bd){bd=d;best=b;}}
+  const info=$("quakeInfo");
+  if(best){S.selectedQuake=best.q.id;showQuakeInfo(best.q);}
+  else{S.selectedQuake=null;info.classList.remove("show");}
+});
+function showQuakeInfo(q){
+  const info=$("quakeInfo");
+  const feltTxt=q.felt>=4.5?"⚠️ Probablemente se sintió fuerte en tu zona":q.felt>=2.5?"🔸 Pudo sentirse levemente en tu zona":"✅ Imperceptible en tu ubicación";
+  info.innerHTML=`<b style="color:${magColor(q.mag)}">M${q.mag.toFixed(1)}</b> — ${q.place}<br>
+    📏 A <b>${Math.round(q.dist)} km</b> de ti · Profundidad ${Math.round(q.depth)} km · ${timeAgo(q.time)}<br>${feltTxt}`;
+  info.classList.add("show");
+}
+
+/* ================= LIST ================= */
+function renderList(){
+  const el=$("quakeList");
+  if(!S.quakes.length){el.innerHTML=`<div class="empty">🌿 Sin sismos de M≥${S.minMag} en ${S.radiusKm} km durante los últimos 7 días.<br>¡Buenas noticias!</div>`;return;}
+  el.innerHTML=S.quakes.map(q=>`
+    <div class="quake" data-id="${q.id}">
+      <div class="magBadge" style="background:${magColor(q.mag)}">${q.mag.toFixed(1)}</div>
+      <div><div class="place">${q.place}</div>
+      <div class="meta">${timeAgo(q.time)} · prof. ${Math.round(q.depth)} km</div></div>
+      <div class="dist"><b>${Math.round(q.dist)}</b><small>km</small></div>
+    </div>`).join("");
+  el.querySelectorAll(".quake").forEach(d=>d.addEventListener("click",()=>{
+    const q=S.quakes.find(x=>x.id===d.dataset.id);if(!q)return;
+    S.selectedQuake=q.id;switchView("radar");showQuakeInfo(q);
+  }));
+}
+
+/* ================= SEISMOMETER ================= */
+const sc=$("seismoCanvas"),sctx=sc.getContext("2d");
+function sizeSeismo(){sc.width=sc.clientWidth*devicePixelRatio;sc.height=180*devicePixelRatio;sctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);}
+async function toggleSeismo(){
+  if(S.seismoOn){S.seismoOn=false;window.removeEventListener("devicemotion",onMotion);
+    $("btnSeismo").textContent="▶️ Activar sismógrafo";$("btnSeismo").classList.remove("off");
+    $("gState").textContent="—";return;}
+  // iOS permission
+  if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function"){
+    try{const p=await DeviceMotionEvent.requestPermission();if(p!=="granted"){toast("Permiso de sensores denegado");return;}}catch(e){toast("No se pudo acceder al sensor");return;}
+  }
+  if(!window.DeviceMotionEvent){toast("Este dispositivo no tiene acelerómetro accesible");return;}
+  S.seismoOn=true;S.seismoBuf=[];S.seismoPeak=0;S.baseline=null;S.triggerCount=0;
+  window.addEventListener("devicemotion",onMotion);
+  $("btnSeismo").textContent="⏸️ Detener sismógrafo";$("btnSeismo").classList.add("off");
+  $("gState").textContent="Calibrando…";
+  toast("📈 Sismógrafo activo — deja el teléfono quieto");
+  drawSeismo();
+}
+function onMotion(e){
+  const a=e.accelerationIncludingGravity;if(!a||a.x==null)return;
+  const magn=Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z);
+  if(S.baseline==null)S.baseline=magn;
+  S.baseline=S.baseline*0.995+magn*0.005;       // slow-moving gravity baseline
+  const dev=Math.abs(magn-S.baseline);           // deviation = shaking
+  S.seismoBuf.push(dev);if(S.seismoBuf.length>400)S.seismoBuf.shift();
+  if(dev>S.seismoPeak)S.seismoPeak=dev;
+  $("gNow").textContent=dev.toFixed(2);
+  $("gPeak").textContent=S.seismoPeak.toFixed(2);
+  // trigger: sustained strong shaking (≈ like STA/LTA)
+  if(dev>2.5)S.triggerCount++;else S.triggerCount=Math.max(0,S.triggerCount-2);
+  if(S.triggerCount>25&&!S.alertActive){
+    S.triggerCount=0;
+    fireAlert("¡VIBRACIÓN FUERTE DETECTADA!","El acelerómetro de tu teléfono registró un movimiento sostenido compatible con un sismo. Protégete AHORA.");
+  }
+  const shaking=dev>2.5?"🔴 FUERTE":dev>0.8?"🟡 Vibrando":"🟢 Estable";
+  $("gState").textContent=shaking;
+}
+function drawSeismo(){
+  if(!S.seismoOn)return;
+  const w=sc.width/devicePixelRatio,h=180;
+  sctx.clearRect(0,0,w,h);
+  // grid
+  sctx.strokeStyle="rgba(56,189,248,.08)";sctx.lineWidth=1;
+  for(let y=0;y<h;y+=30){sctx.beginPath();sctx.moveTo(0,y);sctx.lineTo(w,y);sctx.stroke();}
+  sctx.beginPath();sctx.moveTo(0,h/2);sctx.lineTo(w,h/2);sctx.strokeStyle="rgba(143,163,200,.25)";sctx.stroke();
+  // waveform (mirrored around center like a seismogram)
+  const buf=S.seismoBuf,n=buf.length;
+  if(n>1){
+    sctx.beginPath();
+    for(let i=0;i<n;i++){
+      const x=i/399*w;
+      const y=h/2-Math.min(buf[i]*14,h/2-4)*(i%2?1:-1);
+      i?sctx.lineTo(x,y):sctx.moveTo(x,y);
+    }
+    const last=buf[n-1];
+    sctx.strokeStyle=last>2.5?"#f87171":last>0.8?"#fbbf24":"#4ade80";
+    sctx.lineWidth=1.6;sctx.stroke();
+  }
+  requestAnimationFrame(drawSeismo);
+}
+
+/* ================= ALERTS ================= */
+function fireAlert(title,msg){
+  if(S.alertActive)return;S.alertActive=true;
+  $("alertTitle").textContent=title;$("alertMsg").textContent=msg;
+  $("alertOverlay").classList.add("show");
+  if(navigator.vibrate)navigator.vibrate([400,150,400,150,800,150,400,150,800]);
+  playSiren();
+  notify("🚨 "+title,msg);
+}
+$("alertDismiss").addEventListener("click",()=>{
+  S.alertActive=false;$("alertOverlay").classList.remove("show");stopSiren();
+});
+let sirenNodes=null;
+function playSiren(){
+  try{
+    S.audioCtx=S.audioCtx||new (window.AudioContext||window.webkitAudioContext)();
+    const ctx=S.audioCtx;if(ctx.state==="suspended")ctx.resume();
+    const osc=ctx.createOscillator(),gain=ctx.createGain(),lfo=ctx.createOscillator(),lfoG=ctx.createGain();
+    osc.type="sawtooth";osc.frequency.value=750;
+    lfo.frequency.value=2.2;lfoG.gain.value=280;
+    lfo.connect(lfoG);lfoG.connect(osc.frequency);
+    gain.gain.value=0.22;
+    osc.connect(gain);gain.connect(ctx.destination);
+    osc.start();lfo.start();
+    sirenNodes={osc,lfo,gain};
+    setTimeout(stopSiren,20000);
+  }catch(e){}
+}
+function stopSiren(){if(sirenNodes){try{sirenNodes.osc.stop();sirenNodes.lfo.stop();}catch(e){}sirenNodes=null;}}
+function notify(title,body){
+  if(!("Notification"in window)||Notification.permission!=="granted")return;
+  try{new Notification(title,{body,icon:"icon.svg",badge:"icon.svg",vibrate:[300,100,300]});}catch(e){
+    navigator.serviceWorker?.ready.then(r=>r.showNotification(title,{body,vibrate:[300,100,300]}));
+  }
+}
+
+/* ================= UI WIRING ================= */
+function switchView(v){
+  document.querySelectorAll(".view").forEach(x=>x.classList.toggle("active",x.id==="view-"+v));
+  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("active",b.dataset.view===v));
+  if(v==="seismo")sizeSeismo();
+}
+document.querySelectorAll("nav button").forEach(b=>b.addEventListener("click",()=>switchView(b.dataset.view)));
+
+$("btnCity").addEventListener("click",()=>{
+  S.cityIdx=(S.cityIdx+1)%CITIES.length;
+  const c=CITIES[S.cityIdx];
+  if(c.gps){
+    $("btnCity").textContent="📍 GPS…";
+    if(!navigator.geolocation){toast("GPS no disponible");return;}
+    navigator.geolocation.getCurrentPosition(p=>{
+      S.lat=p.coords.latitude;S.lon=p.coords.longitude;S.cityName="tu ubicación";
+      $("btnCity").textContent="📍 Mi ubicación";
+      toast("Ubicación GPS activada");reload();
+    },()=>{toast("No se pudo obtener el GPS — usa HTTPS o localhost");$("btnCity").textContent="📍 GPS ✗";});
+  }else{
+    S.lat=c.lat;S.lon=c.lon;S.cityName=c.name;
+    $("btnCity").textContent="📍 "+c.name;
+    reload();
+  }
+});
+$("setRadius").addEventListener("change",e=>{S.radiusKm=+e.target.value;reload();});
+$("setMinMag").addEventListener("change",e=>{S.minMag=+e.target.value;reload();});
+$("btnNotif").addEventListener("click",async()=>{
+  if(!("Notification"in window)){toast("Notificaciones no soportadas");return;}
+  const p=await Notification.requestPermission();
+  toast(p==="granted"?"🔔 Notificaciones activadas":"Notificaciones denegadas");
+  if(p==="granted")notify("Alerta Sísmica activa","Te avisaremos si hay sismos importantes cerca de ti.");
+});
+$("btnSeismo").addEventListener("click",toggleSeismo);
+function reload(){S.firstLoad=true;S.knownIds.clear();$("statusTxt").textContent="Actualizando…";fetchQuakes();}
+
+/* ================= BOOT ================= */
+window.addEventListener("resize",()=>{sizeRadar();sizeSeismo();});
+sizeRadar();drawRadar();
+fetchQuakes();
+setInterval(fetchQuakes,60000);
+if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js").catch(()=>{});
+</script>
+</body>
+</html>

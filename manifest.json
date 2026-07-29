@@ -1,0 +1,14 @@
+{
+  "name": "Alerta Sísmica Colombia",
+  "short_name": "AlertaSismo",
+  "description": "Monitoreo de sismos en tiempo real para Villavicencio, Bogotá y Colombia. Radar sísmico, sismógrafo con sensores del teléfono y guía de emergencia.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b1120",
+  "theme_color": "#0b1120",
+  "lang": "es-CO",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

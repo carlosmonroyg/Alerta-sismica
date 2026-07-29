@@ -1,0 +1,15 @@
+# === Sistema operativo / editores ===
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+.vscode/
+.idea/
+
+# === Node (servidor local de pruebas) ===
+node_modules/
+npm-debug.log*
+
+# Nota: app_flutter/ y app_flutter/android/ tienen su propio .gitignore
+# generado por Flutter para excluir build/, .dart_tool/, .gradle/,
+# local.properties, keystores, etc.
