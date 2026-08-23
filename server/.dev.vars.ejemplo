@@ -1,0 +1,7 @@
+# Plantilla de variables. Copiar a .dev.vars para desarrollo local.
+ADMIN_TOKEN=pon-aqui-una-clave-larga
+# Credenciales de la cuenta de servicio de Firebase (opcional: sin ellas el
+# servidor funciona en modo prueba y no envía notificaciones reales).
+FCM_PROJECT_ID=
+FCM_CLIENT_EMAIL=
+FCM_PRIVATE_KEY=

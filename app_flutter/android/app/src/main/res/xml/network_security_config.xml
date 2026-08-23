@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android bloquea el tráfico sin cifrar desde Android 9. Aquí se permite
+     ÚNICAMENTE hacia el equipo de desarrollo (127.0.0.1 por el puente USB y
+     10.0.2.2 en el emulador). Todo lo demás sigue exigiendo HTTPS. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

@@ -14,6 +14,37 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:vibration/vibration.dart';
 
 import 'detector.dart';
+import 'quake_notify.dart';
+import 'servidor.dart';
+import 'sources.dart';
+
+// Claves de configuración compartidas con la app (ubicación y filtros del
+// usuario) para que el servicio pueda consultar los catálogos por su cuenta.
+const kCfgLat = 'w_lat';
+const kCfgLon = 'w_lon';
+const kCfgRadius = 'w_radius';
+const kCfgMinMag = 'w_minmag';
+const kCfgAnonId = 'w_anonid';
+const kCfgServidor = 'w_servidor';
+
+/// Guarda la configuración de vigilancia para el isolate del servicio.
+Future<void> saveWatchConfig({
+  required double lat,
+  required double lon,
+  required double radiusKm,
+  required double minMag,
+  String anonId = '',
+  String servidorUrl = '',
+}) async {
+  try {
+    await FlutterForegroundTask.saveData(key: kCfgLat, value: lat);
+    await FlutterForegroundTask.saveData(key: kCfgLon, value: lon);
+    await FlutterForegroundTask.saveData(key: kCfgRadius, value: radiusKm);
+    await FlutterForegroundTask.saveData(key: kCfgMinMag, value: minMag);
+    await FlutterForegroundTask.saveData(key: kCfgAnonId, value: anonId);
+    await FlutterForegroundTask.saveData(key: kCfgServidor, value: servidorUrl);
+  } catch (_) {}
+}
 
 const kConsejosDelDia = [
   '🎒 Ten lista tu mochila de emergencia: agua, linterna, pito y botiquín.',
@@ -81,6 +112,8 @@ void startSeismoTaskCallback() {
 
 class SeismoTaskHandler extends TaskHandler {
   StreamSubscription<UserAccelerometerEvent>? _sub;
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _gyroMag = 0;
   final _detector = StaLtaDetector(sampleRate: 50);
   final _notifs = FlutterLocalNotificationsPlugin();
   AudioPlayer? _siren;
@@ -88,6 +121,13 @@ class SeismoTaskHandler extends TaskHandler {
   DateTime _lastAlarm = DateTime.fromMillisecondsSinceEpoch(0);
   int _tipIdx = -1;
   int _sample = 0;
+
+  // Sondeo de catálogos con la app cerrada.
+  final Set<String> _knownIds = {};
+  bool _firstPoll = true, _polling = false;
+  int _cycle = 0;
+  EmscLiveFeed? _live;
+  double _lat = 0, _lon = 0, _radiusKm = 500, _minMag = 2.5;
 
   @override
   Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
@@ -97,19 +137,48 @@ class SeismoTaskHandler extends TaskHandler {
     _sub = userAccelerometerEventStream(
             samplingPeriod: const Duration(milliseconds: 20))
         .listen(_onMotion, onError: (_) {});
+    // El giroscopio distingue manipulación de onda sísmica: un teléfono sobre
+    // una mesa se desplaza durante un sismo, pero apenas rota.
+    _gyroSub = gyroscopeEventStream(
+            samplingPeriod: const Duration(milliseconds: 40))
+        .listen((e) {
+      _gyroMag = math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+    }, onError: (_) {});
+
+    // Canal en tiempo real del EMSC: los sismos llegan empujados en segundos,
+    // sin esperar al siguiente sondeo. Es lo que hace útil la app cerrada.
+    _live = EmscLiveFeed(onEvent: _onLiveEvent)..start();
+  }
+
+  /// Sismo empujado por el WebSocket del EMSC (app cerrada).
+  Future<void> _onLiveEvent(Map<String, dynamic> props) async {
+    if (_lat == 0 && _lon == 0) return; // aún sin ubicación configurada
+    final q = quakeFromEmscProps(props, _lat, _lon);
+    if (q == null) return;
+    if (q.dist > _radiusKm || q.mag < _minMag) return;
+    if (_knownIds.contains(q.id)) return;
+    _knownIds.add(q.id);
+    if (DateTime.now().difference(q.time).inMinutes > 90) return;
+    try {
+      if (await FlutterForegroundTask.isAppOnForeground) return;
+    } catch (_) {}
+    await showQuakeNotification(_notifs, q);
   }
 
   void _onMotion(UserAccelerometerEvent e) {
     final m = math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
-    final st = _detector.process(m);
+    final st = _detector.process(m, gyroMag: _gyroMag);
     _sample++;
-    // Estado hacia la UI (si está abierta), 1 vez por segundo.
+    // Estado hacia la UI (si está abierta), ~1 vez por segundo.
     if (_sample % 50 == 0) {
       FlutterForegroundTask.sendDataToMain({
         'type': 'status',
         'sta': st.sta,
         'ratio': st.ratio,
         'ready': st.ready,
+        'armed': st.armed,
+        'still': st.stillSeconds,
+        'rate': st.measuredRate,
       });
     }
     if (st.triggered) _alarm(st);
@@ -121,6 +190,10 @@ class SeismoTaskHandler extends TaskHandler {
 
     // Avisar a la UI por si la app está abierta (overlay rojo).
     FlutterForegroundTask.sendDataToMain({'type': 'alarm'});
+
+    // Aportar la detección al consenso comunitario: un golpe afecta a un
+    // teléfono, un sismo a muchos a la vez.
+    await _reportarDeteccion(st);
 
     try {
       if (await Vibration.hasVibrator()) {
@@ -156,6 +229,23 @@ class SeismoTaskHandler extends TaskHandler {
     );
   }
 
+  Future<void> _reportarDeteccion(DetectorStatus st) async {
+    try {
+      final url =
+          await FlutterForegroundTask.getData<String>(key: kCfgServidor) ?? '';
+      final anon =
+          await FlutterForegroundTask.getData<String>(key: kCfgAnonId) ?? '';
+      if (url.isEmpty || anon.isEmpty || (_lat == 0 && _lon == 0)) return;
+      Servidor.baseUrl = url;
+      await Servidor.enviarDeteccion(
+        anonId: anon,
+        lat: _lat,
+        lon: _lon,
+        intensidad: st.sta,
+      );
+    } catch (_) {}
+  }
+
   @override
   void onRepeatEvent(DateTime timestamp) {
     // Rotar el consejo de prevención en la notificación permanente.
@@ -167,11 +257,81 @@ class SeismoTaskHandler extends TaskHandler {
         notificationText: kConsejosDelDia[idx],
       );
     }
+    // Consultar los catálogos aunque la app esté cerrada: así el usuario
+    // recibe el aviso en la barra de estado sin tener que abrirla.
+    _pollCatalogs();
+  }
+
+  Future<void> _pollCatalogs() async {
+    if (_polling) return;
+    _polling = true;
+    try {
+      final lat = await FlutterForegroundTask.getData<double>(key: kCfgLat);
+      final lon = await FlutterForegroundTask.getData<double>(key: kCfgLon);
+      if (lat == null || lon == null) return; // sin ubicación aún
+      final radiusKm =
+          await FlutterForegroundTask.getData<double>(key: kCfgRadius) ?? 500;
+      final minMag =
+          await FlutterForegroundTask.getData<double>(key: kCfgMinMag) ?? 2.5;
+      _lat = lat;
+      _lon = lon;
+      _radiusKm = radiusKm;
+      _minMag = minMag;
+
+      // Frecuencia por fuente según su retraso real de publicación (medido):
+      // EMSC ~9 min y además llega por WebSocket, USGS ~18 min, SGC ~30-60 min
+      // (solo publica soluciones revisadas por un analista). Consultarlas cada
+      // minuto no adelantaría nada y gastaría datos del usuario.
+      final fuentes = <String>{};
+      if (_firstPoll || _cycle % 2 == 0) fuentes.add('USGS'); //  ~2 min
+      if (_firstPoll || _cycle % 10 == 0) fuentes.add('SGC'); // ~10 min
+      if (_firstPoll || _cycle % 15 == 0) fuentes.add('EMSC'); // respaldo del WS
+      _cycle++;
+      if (fuentes.isEmpty) return;
+
+      final res = await fetchAllSources(
+        lat: lat,
+        lon: lon,
+        radiusKm: radiusKm,
+        minMag: minMag,
+        sgcMaxPages: 1, // los eventos nuevos van al inicio de la página 1
+        only: fuentes,
+        // Para alertar solo importan las últimas horas, no el historial.
+        window: const Duration(hours: 3),
+      );
+      if (res.sourcesOk.isEmpty) return;
+
+      // Si la app está abierta, ella misma avisa: evitar el aviso duplicado.
+      var appVisible = false;
+      try {
+        appVisible = await FlutterForegroundTask.isAppOnForeground;
+      } catch (_) {}
+
+      for (final q in res.quakes) {
+        if (_knownIds.contains(q.id)) continue;
+        _knownIds.add(q.id);
+        if (_firstPoll) continue; // la primera pasada solo memoriza
+        if (q.dist > radiusKm) continue;
+        if (DateTime.now().difference(q.time).inMinutes > 90) continue;
+        if (appVisible) continue;
+        await showQuakeNotification(_notifs, q);
+      }
+      if (_knownIds.length > 400) {
+        _knownIds.removeAll(_knownIds.take(_knownIds.length - 400).toList());
+      }
+      _firstPoll = false;
+    } catch (_) {
+      // Sin red o catálogos caídos: se reintenta en el siguiente ciclo.
+    } finally {
+      _polling = false;
+    }
   }
 
   @override
   Future<void> onDestroy(DateTime timestamp) async {
+    _live?.stop();
     await _sub?.cancel();
+    await _gyroSub?.cancel();
     _sirenTimer?.cancel();
     await _siren?.stop();
     await _siren?.dispose();

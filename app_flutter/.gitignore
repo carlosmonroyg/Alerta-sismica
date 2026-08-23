@@ -43,3 +43,12 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# === Credenciales (repetido aquí a propósito: si esta carpeta se copia o se
+# extrae a su propio repositorio, sigue protegida sin depender de la raíz) ===
+claves.env
+google-services.json
+GoogleService-Info.plist
+key.properties
+*.jks
+*.keystore

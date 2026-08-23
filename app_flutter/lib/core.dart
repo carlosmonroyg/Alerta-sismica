@@ -118,4 +118,11 @@ const cities = [
   City('Mi ubicación GPS', gps: true),
 ];
 
+/// Zona geográfica de ~111 km que se usa como "tema" de las notificaciones
+/// push. Debe coincidir EXACTAMENTE con zonaDe() del servidor
+/// (server/src/geo.js): si las dos fórmulas se separan, el teléfono queda
+/// suscrito a un tema al que nadie publica y deja de recibir avisos.
+String zonaFcm(double lat, double lon) =>
+    'z_${lat.floor()}_${lon.floor()}';
+
 enum RiskLevel { safe, watch, danger }

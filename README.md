@@ -28,19 +28,35 @@ Es un proyecto de **bien público, sin fines de lucro**: código abierto, sin co
 
 ```
 alerta-sismica/
-├── index.html, sw.js, manifest.json, servidor.js, icon.svg   # PWA (versión web)
-└── app_flutter/                                              # App nativa (Flutter/Dart)
-    ├── lib/            # Código fuente (core, radar, detector de sismos, mapa, servicios)
-    ├── assets/         # Audio de sirena, datos de fallas geológicas, íconos
-    ├── android/        # Proyecto Android
-    └── test/           # Pruebas
+├── index.html, sw.js, manifest.json, servidor.js   # PWA original (prototipo web)
+├── app_flutter/                                    # App Android (Flutter/Dart)
+│   ├── lib/            # core, radar, detector, mapa, push, cliente del servidor
+│   ├── lib/panel_main.dart   # panel municipal (Flutter Web, mismo lenguaje)
+│   ├── assets/         # sirena, fallas geológicas, íconos
+│   ├── android/        # proyecto Android
+│   ├── test/           # pruebas (16)
+│   ├── claves.ejemplo.env    # plantilla de credenciales (copiar a claves.env)
+│   └── compilar.sh     # compila inyectando claves.env
+└── server/                                         # Servidor (Cloudflare Workers + D1)
+    ├── src/            # geo, fuentes, fcm, index (rutas y tarea programada)
+    ├── schema.sql      # tablas
+    ├── .dev.vars.ejemplo     # plantilla de secretos del servidor
+    └── desplegar.sh    # publica todo en Cloudflare
 ```
 
-Ambas versiones comparten la misma lógica de negocio (radar, riesgo, sismógrafo, alertas) — la PWA es el prototipo original en JavaScript y `app_flutter` es el puerto nativo con más capacidades (vigilancia en segundo plano, notificaciones nativas).
+Las tres piezas comparten la misma lógica: `app_flutter/lib/core.dart` define el
+modelo, la paleta y las fórmulas (haversine, intensidad, zona FCM), y la app y el
+panel lo importan. El servidor replica esas fórmulas en `server/src/geo.js`: si se
+tocan en un lado hay que tocarlas en el otro, o el teléfono queda suscrito a una
+zona a la que nadie publica.
 
 ## Fuente de datos
 
-- **USGS** (Servicio Geológico de EE.UU.) — API FDSN pública, gratuita, sin clave, cobertura global incluida Colombia: `earthquake.usgs.gov/fdsnws/event/1/query`.
+Tres catálogos públicos, combinados y deduplicados:
+
+- **SGC** (Servicio Geológico Colombiano) — la fuente oficial del país. Publica solo soluciones revisadas por analista, con 30-60+ min de retraso.
+- **USGS** (EE.UU.) — API FDSN pública, sin clave, cobertura global.
+- **EMSC** (Europa) — la más rápida de las tres (1-7 min), la que sostiene el aviso temprano.
 - El sistema de Alertas de Terremotos de **Google/Android no tiene API pública**; funciona a nivel del sistema operativo. Este proyecto replica el concepto con datos abiertos + sensores del dispositivo.
 - Fuente oficial en Colombia: **Servicio Geológico Colombiano** (sgc.gov.co).
 
@@ -58,13 +74,61 @@ Abre `http://localhost:8080` (el GPS, los sensores y el service worker requieren
 
 Para usarla en el celular, el GPS/acelerómetro/notificaciones requieren HTTPS: publica la carpeta en GitHub Pages o Netlify Drop, y en el celular abre la URL en Chrome → menú → "Añadir a pantalla de inicio".
 
-### Versión Flutter (Android/iOS)
+### Versión Flutter (Android)
 
-```powershell
+```bash
 cd alerta-sismica/app_flutter
 flutter pub get
-flutter run
+flutter run                 # desarrollo, sin servidor ni push
 ```
+
+Para compilar con servidor y notificaciones push hay que dar los valores del
+despliegue propio. No están en el repositorio:
+
+```bash
+cp claves.ejemplo.env claves.env    # rellenar los valores
+bash compilar.sh                    # APK de release
+bash compilar.sh panel              # panel web
+```
+
+Con `claves.env` vacío la app **compila y funciona igual**, solo que sin servidor
+ni push: consulta los catálogos por su cuenta, como siempre.
+
+### Servidor
+
+```bash
+cd server
+npx wrangler login          # una sola vez, abre el navegador
+bash desplegar.sh           # crea la base, carga secretos y publica
+```
+
+Imprime al final la URL pública, que es la que va en `SERVIDOR_URL` de `claves.env`.
+Detalles en [server/README.md](server/README.md).
+
+## Credenciales: qué es secreto y qué no
+
+**Nada de esto vive en el repositorio.** El historial se auditó y nunca ha
+contenido una credencial.
+
+| Archivo | Qué guarda | Riesgo si se filtra |
+|---|---|---|
+| `server/.dev.vars` | Clave privada de la cuenta de servicio de Firebase | **Grave.** Permite enviar notificaciones en nombre de la app: alertas de sismo falsas a todos los usuarios. |
+| `app_flutter/claves.env` | URL del servidor y los 4 valores de Firebase | Bajo. Ver abajo. |
+| `app_flutter/android/app/google-services.json` | Los mismos 4 valores | Bajo. |
+| `*.jks`, `key.properties` | Firma de Android para Play Store | **Grave.** Quien la tenga puede publicar actualizaciones suplantando la app. |
+
+Sobre los cuatro valores de Firebase, dicho con honestidad: **no son un secreto
+criptográfico**. Viajan dentro de cualquier APK y quien descargue la app puede
+extraerlos; Firebase los protege con las reglas del proyecto, no ocultándolos. Se
+mantienen fuera del repositorio por higiene y para no invitar a que otros consuman
+la cuota del proyecto, no porque filtrarlos comprometa las cuentas.
+
+La que sí importa de verdad es la **cuenta de servicio**: con ella se pueden
+disparar alertas falsas. Vive solo en `.dev.vars` (local) y como secreto cifrado
+de Cloudflare (producción).
+
+Si alguna vez se sube un secreto por error, quitarlo en un commit posterior **no
+sirve**: queda en el historial. Hay que rotarlo en la consola que lo emitió.
 
 ## Limitaciones honestas
 

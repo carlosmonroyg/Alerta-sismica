@@ -13,6 +13,14 @@ import 'package:latlong2/latlong.dart';
 
 import 'core.dart';
 
+/// Orden de encuadre del mapa (p. ej. al tocar la notificación de un sismo).
+/// [seq] permite repetir el mismo destino y que el mapa vuelva a moverse.
+class MapFocus {
+  final double lat, lon;
+  final int seq;
+  const MapFocus(this.lat, this.lon, this.seq);
+}
+
 class _Fault {
   final String name, slipType;
   final List<LatLng> points;
@@ -37,6 +45,7 @@ class QuakeMapView extends StatefulWidget {
   final double lat, lon, radiusKm;
   final String? selectedId;
   final ValueChanged<String?> onSelect;
+  final MapFocus? focus;
 
   const QuakeMapView({
     super.key,
@@ -46,6 +55,7 @@ class QuakeMapView extends StatefulWidget {
     required this.radiusKm,
     required this.selectedId,
     required this.onSelect,
+    this.focus,
   });
 
   @override
@@ -87,6 +97,12 @@ class _QuakeMapViewState extends State<QuakeMapView> {
   @override
   void didUpdateWidget(covariant QuakeMapView old) {
     super.didUpdateWidget(old);
+    // Encuadre pedido desde fuera (toque en la notificación de un sismo).
+    final f = widget.focus;
+    if (f != null && f.seq != old.focus?.seq) {
+      _controller.move(LatLng(f.lat, f.lon), 9);
+      return;
+    }
     // Recentrar cuando el usuario cambia de ciudad o llega el GPS.
     if (old.lat != widget.lat || old.lon != widget.lon) {
       _controller.move(LatLng(widget.lat, widget.lon), 7);

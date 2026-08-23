@@ -1,0 +1,25 @@
+name = "alerta-sismica"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# El sondeo corre cada minuto; dentro se escalona por fuente según el retraso
+# real de publicación de cada catálogo (USGS ~2 min, SGC ~10 min, EMSC ~15 min).
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "alerta_sismica"
+database_id = "0a3bea9c-5a68-4864-b45e-ce1b2c34a0db"
+
+[vars]
+# Radio (km) alrededor del epicentro al que se envía la alerta.
+RADIO_ALERTA_KM = "300"
+# Detecciones ciudadanas distintas, dentro de la ventana, para declarar consenso.
+CONSENSO_MINIMO = "4"
+
+
+# El panel municipal es una app Flutter Web (Dart) compilada en publico/panel.
+[assets]
+directory = "./publico"
+binding = "ASSETS"

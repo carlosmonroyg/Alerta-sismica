@@ -1,0 +1,19 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+
+# Panel compilado (~27 MB): es resultado de compilar, no fuente. Si falta,
+# desplegar.sh lo reconstruye solo a partir de app_flutter/lib/panel_main.dart.
+publico/panel/
+
+# === Credenciales ===
+# .dev.vars (arriba) guarda la clave privada de la cuenta de servicio de
+# Firebase: es LO MÁS delicado del proyecto, permite enviar notificaciones en
+# nombre de la app. En producción vive como secreto cifrado de Cloudflare.
+.dev.vars.*
+!.dev.vars.ejemplo
+*adminsdk*.json
+*service-account*.json
+*.pem
+*.key

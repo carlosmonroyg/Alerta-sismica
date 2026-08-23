@@ -9,6 +9,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'core.dart';
@@ -23,11 +24,20 @@ class FetchResult {
 
 /// Consulta SGC + USGS + EMSC en paralelo. Nunca lanza: las fuentes caídas
 /// simplemente no aparecen en [FetchResult.sourcesOk].
+///
+/// [sgcMaxPages] controla cuánto historial del SGC se descarga: su API ignora
+/// todo filtro y devuelve páginas fijas de 100 eventos (~88 KB cada una), así
+/// que para el sondeo periódico basta 1 página (los eventos nuevos van al
+/// principio) y se reservan 3 para la carga inicial del historial de 7 días.
+/// [only] permite consultar solo algunas fuentes y escalonar su frecuencia.
 Future<FetchResult> fetchAllSources({
   required double lat,
   required double lon,
   required double radiusKm,
   required double minMag,
+  int sgcMaxPages = 3,
+  Set<String> only = const {'SGC', 'USGS', 'EMSC'},
+  Duration window = const Duration(days: 7),
 }) async {
   Future<List<Quake>?> guard(Future<List<Quake>> Function() f) async {
     try {
@@ -37,11 +47,18 @@ Future<FetchResult> fetchAllSources({
     }
   }
 
+  final desde = DateTime.now().toUtc().subtract(window);
   // El orden define la prioridad en la deduplicación.
   final results = await Future.wait([
-    guard(() => _fetchSgc(lat, lon, radiusKm, minMag)),
-    guard(() => _fetchUsgs(lat, lon, radiusKm, minMag)),
-    guard(() => _fetchEmsc(lat, lon, radiusKm, minMag)),
+    only.contains('SGC')
+        ? guard(() => _fetchSgc(lat, lon, radiusKm, minMag, sgcMaxPages, desde))
+        : Future.value(null),
+    only.contains('USGS')
+        ? guard(() => _fetchUsgs(lat, lon, radiusKm, minMag, desde))
+        : Future.value(null),
+    only.contains('EMSC')
+        ? guard(() => _fetchEmsc(lat, lon, radiusKm, minMag, desde))
+        : Future.value(null),
   ]);
   const names = ['SGC', 'USGS', 'EMSC'];
   final ok = <String>[];
@@ -70,16 +87,14 @@ List<Quake> dedupQuakes(List<Quake> all) {
   return merged;
 }
 
-DateTime get _cutoff => DateTime.now().toUtc().subtract(const Duration(days: 7));
-
 // ---------------- USGS ----------------
-Future<List<Quake>> _fetchUsgs(
-    double lat, double lon, double radiusKm, double minMag) async {
+Future<List<Quake>> _fetchUsgs(double lat, double lon, double radiusKm,
+    double minMag, DateTime desde) async {
   final url = Uri.parse(
       'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson'
       '&latitude=$lat&longitude=$lon&maxradiuskm=${radiusKm.round()}'
       '&minmagnitude=$minMag&orderby=time&limit=120'
-      '&starttime=${_cutoff.toIso8601String()}');
+      '&starttime=${desde.toIso8601String()}');
   final r = await http.get(url).timeout(_timeout);
   if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
   final j = jsonDecode(r.body) as Map<String, dynamic>;
@@ -106,11 +121,10 @@ Future<List<Quake>> _fetchUsgs(
 // El catálogo oficial devuelve páginas de 100 eventos ordenados del más
 // reciente al más antiguo; el filtrado se hace del lado del cliente
 // (igual que el visor oficial en sgc.gov.co/sismos).
-Future<List<Quake>> _fetchSgc(
-    double lat, double lon, double radiusKm, double minMag) async {
+Future<List<Quake>> _fetchSgc(double lat, double lon, double radiusKm,
+    double minMag, int maxPages, DateTime cutoff) async {
   final out = <Quake>[];
-  final cutoff = _cutoff;
-  for (var page = 1; page <= 3; page++) {
+  for (var page = 1; page <= maxPages; page++) {
     final r = await http
         .post(
           Uri.parse(
@@ -159,14 +173,14 @@ Future<List<Quake>> _fetchSgc(
 }
 
 // ---------------- EMSC ----------------
-Future<List<Quake>> _fetchEmsc(
-    double lat, double lon, double radiusKm, double minMag) async {
+Future<List<Quake>> _fetchEmsc(double lat, double lon, double radiusKm,
+    double minMag, DateTime desde) async {
   final radiusDeg = (radiusKm / 111.0).toStringAsFixed(2);
   final url = Uri.parse(
       'https://www.seismicportal.eu/fdsnws/event/1/query?format=json'
       '&latitude=$lat&longitude=$lon&maxradius=$radiusDeg'
       '&minmagnitude=$minMag&orderby=time&limit=150'
-      '&starttime=${_cutoff.toIso8601String()}');
+      '&starttime=${desde.toIso8601String()}');
   final r = await http.get(url).timeout(_timeout);
   if (r.statusCode == 204) return []; // EMSC responde 204 sin resultados
   if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
@@ -237,7 +251,14 @@ class EmscLiveFeed {
   void _connect() {
     if (_stopped) return;
     try {
-      _channel = WebSocketChannel.connect(_uri);
+      // pingInterval mantiene viva la conexión: en redes móviles el NAT del
+      // operador corta las conexiones TCP inactivas en pocos minutos, y sin
+      // esto la app dejaría de recibir sismos en segundo plano sin avisar.
+      _channel = IOWebSocketChannel.connect(
+        _uri,
+        pingInterval: const Duration(seconds: 25),
+        connectTimeout: const Duration(seconds: 20),
+      );
       _channel!.stream.listen(
         (msg) {
           _setConnected(true);

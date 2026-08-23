@@ -1,8 +1,3 @@
-// Alerta Sísmica Colombia — versión Flutter
-// Port de la PWA: radar sísmico, evaluación de riesgo, sismógrafo con
-// acelerómetro, notificaciones locales y guía de supervivencia.
-// Datos: USGS FDSN (earthquake.usgs.gov), actualizados cada 60 s.
-
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -14,12 +9,17 @@ import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:vibration/vibration.dart';
 
 import 'core.dart';
 import 'detector.dart';
 import 'map_view.dart';
+import 'firebase_config.dart';
+import 'push.dart';
+import 'quake_notify.dart';
 import 'seismo_service.dart';
+import 'servidor.dart';
 import 'sources.dart';
 
 export 'core.dart';
@@ -96,6 +96,12 @@ class _HomePageState extends State<HomePage> {
   // Preferencias e identidad anónima
   SharedPreferences? _prefs;
   String anonId = '…';
+  String servidorUrl = '';
+  String? temaFcm;
+
+  // Encuadre del mapa al tocar una notificación
+  MapFocus? mapFocus;
+  int _focusSeq = 0;
 
   Timer? _pollTimer;
   final _notifs = FlutterLocalNotificationsPlugin();
@@ -115,11 +121,12 @@ class _HomePageState extends State<HomePage> {
     initSeismoServiceConfig();
     FlutterForegroundTask.addTaskDataCallback(_onServiceData);
     _initNotifications();
-    _loadPrefs().then((_) => _fetchQuakes());
+    _iniciarPush();
+    _loadPrefs().then((_) => _fetchQuakes(full: true));
     _initLocation();
     _refreshBgWatchState();
-    _emscFeed.start();
-    _pollTimer = Timer.periodic(const Duration(seconds: 60), (_) => _fetchQuakes());
+    // El trabajo que hace el teléfono se decide al cargar las preferencias,
+    // según haya servidor o no (ver _ajustarFuentes).
   }
 
   // ---------------- Preferencias / ID anónimo ----------------
@@ -136,12 +143,227 @@ class _HomePageState extends State<HomePage> {
       anonId = id!;
       radiusKm = _prefs!.getDouble('radius_km') ?? radiusKm;
       minMag = _prefs!.getDouble('min_mag') ?? minMag;
+      // Lo que el usuario haya configurado manda; si no, el valor de compilación.
+      // Ojo: una preferencia guardada como cadena VACÍA no es lo mismo que
+      // "sin preferencia". Si no hay nada útil guardado, manda la URL fijada
+      // al compilar; así el usuario final nunca tiene que escribirla.
+      final guardado = _prefs!.getString('servidor_url')?.trim() ?? '';
+      servidorUrl = guardado.isEmpty ? Servidor.porDefecto : guardado;
+      Servidor.baseUrl = servidorUrl;
+      debugPrint('SERVIDOR compilado=[${Servidor.porDefecto}] '
+          'enUso=[$servidorUrl] activo=${Servidor.activo}');
       drillLast = _prefs!.getDouble('drill_last');
       drillBest = _prefs!.getDouble('drill_best');
     });
+    await saveWatchConfig(
+      lat: lat,
+      lon: lon,
+      radiusKm: radiusKm,
+      minMag: minMag,
+      anonId: anonId,
+      servidorUrl: servidorUrl,
+    );
+    await _registrarEnServidor();
+    await _suscribirZonaLocal();
+    _ajustarFuentes();
   }
 
-  // ---------------- Vigilancia 24/7 ----------------
+  Future<void> _abrirPanelMunicipal() async {
+    if (!Servidor.activo) return;
+    final base = servidorUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    final url = Uri.parse('$base/panel').replace(
+      queryParameters: {
+        'municipio': cityName,
+        'lat': lat.toStringAsFixed(4),
+        'lon': lon.toStringAsFixed(4),
+      },
+    );
+    final ok = await launchUrl(url, mode: LaunchMode.externalApplication);
+    if (!ok) _toast('No se pudo abrir el panel');
+  }
+
+  /// Suscribe el teléfono a la zona donde está. No depende del servidor:
+  /// la zona se calcula con la misma fórmula, así el push funciona apenas
+  /// se conoce la ubicación.
+  Future<void> _suscribirZonaLocal() async {
+    // El isolate que atiende los avisos con la app cerrada arranca sin estado:
+    // necesita esta ubicación guardada para calcular la distancia al sismo.
+    await _prefs?.setDouble(kPrefUltLat, lat);
+    await _prefs?.setDouble(kPrefUltLon, lon);
+    await Push.suscribirAZona(zonaFcm(lat, lon));
+    if (mounted) setState(() {});
+  }
+
+  /// Enciende las notificaciones push. Es el camino de menor consumo:
+  /// Android ya mantiene una conexión compartida por todas las apps, así
+  /// que el aviso llega sin que el teléfono abra nada propio.
+  Future<void> _iniciarPush() async {
+    final t = await Push.iniciar(
+      alRecibirEnPrimerPlano: _sismoPorPush,
+      alTocarAviso: (datos) {
+        final q = Push.sismoDesdeMensaje(datos, lat, lon);
+        if (q != null) _mostrarEnMapa(q);
+      },
+    );
+    if (t == null || !mounted) return;
+    debugPrint('Push activo · token ${t.substring(0, 12)}…'
+        ' (${t.length} caracteres)');
+    setState(() {});
+    // Registrar el token en el servidor (si lo hay) y suscribirse a la zona.
+    await _registrarEnServidor();
+    await _suscribirZonaLocal();
+  }
+
+  /// Sismo empujado por el servidor con la app abierta.
+  void _sismoPorPush(Map<String, dynamic> datos) {
+    if (datos['tipo'] == 'simulacro') {
+      _fireAlert('SIMULACRO DE SISMO',
+          'Practica: agáchate, cúbrete y sujétate. Pulsa "Estoy a salvo" al terminar.',
+          drill: true);
+      return;
+    }
+    final q = Push.sismoDesdeMensaje(datos, lat, lon);
+    if (q == null) return;
+    if (q.dist > radiusKm || q.mag < minMag) return;
+    if (knownIds.contains(q.id)) return;
+    knownIds.add(q.id);
+    setState(() {
+      quakes
+        ..removeWhere((x) => x.id == q.id)
+        ..insert(0, q)
+        ..sort((a, b) => b.time.compareTo(a.time));
+    });
+    if (_notifsReady) showQuakeNotification(_notifs, q);
+    if (q.felt >= 4.5) {
+      _fireAlert('Sismo M${q.mag.toStringAsFixed(1)} — ${q.place}',
+          'A ${q.dist.round()} km de ti. Podrías sentirlo o recibir réplicas.');
+    } else {
+      _toastQuake(q);
+    }
+    _assessRisk();
+  }
+
+  /// Centra el mapa en un sismo concreto.
+  void _mostrarEnMapa(Quake q) {
+    if (!mounted) return;
+    setState(() {
+      if (!quakes.any((x) => x.id == q.id)) {
+        quakes
+          ..insert(0, q)
+          ..sort((a, b) => b.time.compareTo(a.time));
+      }
+      tab = 1;
+      selectedQuakeId = q.id;
+      mapFocus = MapFocus(q.lat, q.lon, ++_focusSeq);
+    });
+  }
+
+  /// Da de alta el teléfono en el servidor (si está configurado).
+  Future<void> _registrarEnServidor() async {
+    if (!Servidor.activo || anonId == '…') return;
+    final tema = await Servidor.registrar(
+      anonId: anonId,
+      lat: lat,
+      lon: lon,
+      radioKm: radiusKm,
+      minMag: minMag,
+      municipio: cityName,
+      tokenFcm: Push.token,
+    );
+    if (mounted && tema != null) setState(() => temaFcm = tema);
+    // El servidor asigna una zona; el teléfono se suscribe a ella y a
+    // partir de ahí los avisos llegan por push, sin gastar batería.
+    await Push.suscribirAZona(tema);
+  }
+
+  /// Configura el servidor de la plataforma (opcional).
+  Future<void> _configurarServidor() async {
+    final ctrl = TextEditingController(text: servidorUrl);
+    final url = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kPanel,
+        title: const Text(
+          'Servidor de la plataforma',
+          style: TextStyle(fontSize: 16),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Al conectarlo, los sismos llegan ya procesados y el teléfono '
+              'deja de descargar los catálogos completos. Déjalo vacío para '
+              'que la app funcione por su cuenta.',
+              style: TextStyle(fontSize: 12, color: kMuted, height: 1.4),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autocorrect: false,
+              keyboardType: TextInputType.url,
+              style: const TextStyle(fontSize: 13),
+              decoration: const InputDecoration(
+                hintText: 'https://alerta-sismica.workers.dev',
+                hintStyle: TextStyle(color: kMuted, fontSize: 12),
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Guardar'),
+          ),
+        ],
+      ),
+    );
+    if (url == null) return;
+    setState(() {
+      servidorUrl = url;
+      Servidor.baseUrl = url;
+      temaFcm = null;
+    });
+    await _prefs?.setString('servidor_url', url);
+    _ajustarFuentes();
+    if (url.isEmpty) {
+      _toast('Servidor desconectado — la app trabaja por su cuenta');
+    } else {
+      await _registrarEnServidor();
+      _toast(
+        temaFcm != null
+            ? '🛰️ Conectado al servidor · zona $temaFcm'
+            : 'No se pudo conectar con el servidor',
+      );
+    }
+    _reload();
+  }
+
+  /// Decide cuánto trabajo hace el teléfono por su cuenta.
+  ///
+  /// CON servidor: él mantiene el WebSocket del EMSC y consulta los
+  /// catálogos una sola vez para todos, así que el teléfono no abre
+  /// conexiones propias ni sondea seguido. Es la diferencia entre una radio
+  /// que despierta miles de veces al día y una que apenas se usa.
+  ///
+  /// SIN servidor: la app hace ese trabajo sola (más batería y más datos).
+  void _ajustarFuentes() {
+    _pollTimer?.cancel();
+    if (Servidor.activo) {
+      _emscFeed.stop();
+    } else {
+      _emscFeed.start();
+    }
+    _pollTimer = Timer.periodic(
+      Duration(seconds: Servidor.activo ? 300 : 120),
+      (_) => _fetchQuakes(),
+    );
+  }
+
   Future<void> _refreshBgWatchState() async {
     final running = await FlutterForegroundTask.isRunningService;
     if (mounted) setState(() => bgWatchOn = running);
@@ -149,6 +371,14 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _toggleBgWatch(bool value) async {
     if (value) {
+    await saveWatchConfig(
+        lat: lat,
+        lon: lon,
+        radiusKm: radiusKm,
+        minMag: minMag,
+        anonId: anonId,
+        servidorUrl: servidorUrl,
+      );
       final ok = await startSeismoWatch();
       if (!ok) _toast('No se pudo iniciar la vigilancia en segundo plano');
     } else {
@@ -163,14 +393,20 @@ class _HomePageState extends State<HomePage> {
     switch (data['type']) {
       case 'status':
         final sta = (data['sta'] as num?)?.toDouble() ?? 0;
-        final ratio = (data['ratio'] as num?)?.toDouble() ?? 0;
         final ready = data['ready'] == true;
-        serviceStatus.value = ready
-            ? 'Vigilando · vibración ${sta.toStringAsFixed(3)} m/s² · STA/LTA ${ratio.toStringAsFixed(1)}'
-            : 'Calibrando ruido de fondo…';
+        final armed = data['armed'] == true;
+        final still = (data['still'] as num?)?.toDouble() ?? 0;
+        serviceStatus.value = !ready
+            ? 'Calibrando ruido de fondo…'
+            : armed
+            ? '🛡️ Armado · quieto hace ${still.round()} s · vibración ${sta.toStringAsFixed(3)} m/s²'
+            : '✋ En uso — se arma cuando dejes el teléfono quieto '
+                  '(${(45 - still).clamp(0, 45).round()} s)';
       case 'alarm':
-        _fireAlert('¡VIBRACIÓN FUERTE DETECTADA!',
-            'El sismógrafo en segundo plano registró un movimiento sostenido compatible con un sismo. Protégete AHORA.');
+        _fireAlert(
+          '¡VIBRACIÓN FUERTE DETECTADA!',
+          'El sismógrafo en segundo plano registró un movimiento sostenido compatible con un sismo. Protégete AHORA.',
+        );
     }
   }
 
@@ -213,8 +449,10 @@ class _HomePageState extends State<HomePage> {
       await _sirenPlayer.setReleaseMode(ReleaseMode.loop);
       await _sirenPlayer.play(AssetSource('audio/sirena.wav'), volume: 1);
       _sirenTimer?.cancel();
-      _sirenTimer =
-          Timer(const Duration(seconds: 20), () => _sirenPlayer.stop());
+      _sirenTimer = Timer(
+        const Duration(seconds: 20),
+        () => _sirenPlayer.stop(),
+      );
     } catch (_) {}
   }
 
@@ -233,7 +471,7 @@ class _HomePageState extends State<HomePage> {
         for (final candidate in [
           m.locality,
           m.subAdministrativeArea,
-          m.administrativeArea
+          m.administrativeArea,
         ]) {
           if (candidate != null && candidate.trim().isNotEmpty) {
             return candidate.trim();
@@ -244,8 +482,6 @@ class _HomePageState extends State<HomePage> {
     return 'tu ubicación';
   }
 
-  /// Detecta la ubicación GPS del dispositivo al arrancar y recarga los
-  /// sismos alrededor de ella. Si no hay permiso o GPS, se queda en Bogotá.
   Future<void> _initLocation() async {
     try {
       if (!await Geolocator.isLocationServiceEnabled()) return;
@@ -271,8 +507,10 @@ class _HomePageState extends State<HomePage> {
         _reload();
       }
       final p = await Geolocator.getCurrentPosition(
-          locationSettings:
-              const LocationSettings(accuracy: LocationAccuracy.medium));
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+        ),
+      );
       if (!mounted) return;
       final name = await _placeName(p.latitude, p.longitude);
       if (!mounted) return;
@@ -284,9 +522,7 @@ class _HomePageState extends State<HomePage> {
       });
       _reload();
       _toast('📍 Estás en $name');
-    } catch (_) {
-      // Sin GPS: seguimos con la ciudad por defecto.
-    }
+    } catch (_) {}
   }
 
   @override
@@ -303,43 +539,130 @@ class _HomePageState extends State<HomePage> {
     const init = InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     );
-    await _notifs.initialize(init);
-    final android = _notifs.resolvePlatformSpecificImplementation<
-        AndroidFlutterLocalNotificationsPlugin>();
+    await _notifs.initialize(
+      init,
+      onDidReceiveNotificationResponse: (r) => _openQuakeFromPayload(r.payload),
+    );
+    final android = _notifs
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
     final granted = await android?.requestNotificationsPermission();
     _notifsReady = granted ?? false;
+    // Desde Android 14 las alertas que se apoderan de la pantalla requieren
+    // un permiso aparte, pensado para apps de alarma y emergencia. Sin él, un
+    // sismo fuerte quedaría como una tarjeta más en la cortina.
+    try {
+      await android?.requestFullScreenIntentPermission();
+    } catch (_) {}
+    // La app pudo abrirse por un toque en la notificación (estando cerrada).
+    final launch = await _notifs.getNotificationAppLaunchDetails();
+    if (launch?.didNotificationLaunchApp ?? false) {
+      _openQuakeFromPayload(launch!.notificationResponse?.payload);
+    }
+  }
+
+  /// Abre el mapa centrado en el epicentro del sismo de la notificación.
+  void _openQuakeFromPayload(String? payload) {
+    final q = decodeQuakePayload(payload, lat, lon);
+    if (q == null) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      setState(() {
+        // Si el sismo aún no está en la lista (llegó por el servicio), agregarlo.
+        if (!quakes.any((x) => x.id == q.id)) {
+          quakes
+            ..insert(0, q)
+            ..sort((a, b) => b.time.compareTo(a.time));
+        }
+        tab = 1; // pestaña Mapa
+        selectedQuakeId = q.id;
+        mapFocus = MapFocus(q.lat, q.lon, ++_focusSeq);
+      });
+      // Si el sismo es fuerte, la app no se abrió porque el usuario tocara un
+      // aviso: se abrió sola, apoderándose de la pantalla. Lo primero que debe
+      // ver no es un mapa, son las instrucciones para protegerse.
+      if (q.felt >= 4.5) {
+        _fireAlert(
+          'Sismo M${q.mag.toStringAsFixed(1)} — ${q.place}',
+          'A ${q.dist.round()} km de ti. Protégete AHORA y mantente atento a '
+              'las réplicas.',
+        );
+      }
+    });
   }
 
   Future<void> _notify(String title, String body) async {
     if (!_notifsReady) return;
     const details = NotificationDetails(
       android: AndroidNotificationDetails(
-        'sismos', 'Alertas sísmicas',
+        'sismos',
+        'Alertas sísmicas',
         channelDescription: 'Avisos de sismos nuevos cerca de ti',
         importance: Importance.high,
         priority: Priority.high,
       ),
     );
     await _notifs.show(
-        DateTime.now().millisecondsSinceEpoch % 100000, title, body, details);
+      DateTime.now().millisecondsSinceEpoch % 100000,
+      title,
+      body,
+      details,
+    );
   }
 
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(
-        content: Text(msg),
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: kPanel2,
-        duration: const Duration(seconds: 3),
-      ));
+      ..showSnackBar(
+        SnackBar(
+          content: Text(msg),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: kPanel2,
+          duration: const Duration(seconds: 3),
+        ),
+      );
   }
 
   // ---------------- Datos SGC + USGS + EMSC ----------------
-  Future<void> _fetchQuakes() async {
+  /// [full] descarga el historial completo de 7 días (al abrir la app o al
+  /// cambiar de ciudad/filtros). Las recargas periódicas son livianas: el API
+  /// del SGC ignora todo filtro y devuelve 88 KB por página, así que basta la
+  /// primera —donde están los eventos nuevos— y se fusiona con lo que ya hay.
+  Future<void> _fetchQuakes({bool full = false}) async {
+    // El servidor ya entrega los sismos fusionados y deduplicados: usarlo
+    // le ahorra al usuario descargar los catálogos completos (~13 MB/día).
+    if (Servidor.activo) {
+      final delServidor = await Servidor.traerSismos(
+        lat: lat,
+        lon: lon,
+        radiusKm: radiusKm,
+        dias: 7,
+      );
+      if (delServidor != null && mounted) {
+        setState(() {
+          quakes = delServidor;
+          online = true;
+          final now = TimeOfDay.now();
+          final hh = now.hour.toString().padLeft(2, '0');
+          final mm = now.minute.toString().padLeft(2, '0');
+          statusText =
+              'En vivo · ${quakes.length} sismos · servidor 🛰️ · $hh:$mm';
+        });
+        _detectNewQuakes();
+        _assessRisk();
+        return;
+      }
+      // Si el servidor no responde, se cae a los catálogos directos.
+    }
     final res = await fetchAllSources(
-        lat: lat, lon: lon, radiusKm: radiusKm, minMag: minMag);
+      lat: lat,
+      lon: lon,
+      radiusKm: radiusKm,
+      minMag: minMag,
+      sgcMaxPages: full ? 3 : 1,
+    );
     if (!mounted) return;
     if (res.sourcesOk.isEmpty) {
       setState(() {
@@ -348,8 +671,14 @@ class _HomePageState extends State<HomePage> {
       });
       return;
     }
+    final limite = DateTime.now().subtract(const Duration(days: 7));
     setState(() {
-      quakes = res.quakes;
+      quakes = full
+          ? res.quakes
+          : dedupQuakes([
+              ...res.quakes,
+              ...quakes,
+            ]).where((q) => q.time.isAfter(limite)).toList();
       online = true;
       final now = TimeOfDay.now();
       final hh = now.hour.toString().padLeft(2, '0');
@@ -368,10 +697,12 @@ class _HomePageState extends State<HomePage> {
     if (q == null || q.dist > radiusKm || q.mag < minMag) return;
     if (!mounted) return;
     // Evitar duplicar un evento que ya está listado por SGC/USGS.
-    final dup = quakes.any((x) =>
-        x.id != q.id &&
-        x.time.difference(q.time).abs().inSeconds < 120 &&
-        haversineKm(x.lat, x.lon, q.lat, q.lon) < 60);
+    final dup = quakes.any(
+      (x) =>
+          x.id != q.id &&
+          x.time.difference(q.time).abs().inSeconds < 120 &&
+          haversineKm(x.lat, x.lon, q.lat, q.lon) < 60,
+    );
     if (dup) return;
     setState(() {
       quakes
@@ -390,18 +721,47 @@ class _HomePageState extends State<HomePage> {
       if (firstLoad) continue;
       final ageMin = DateTime.now().difference(q.time).inMinutes;
       if (ageMin > 90) continue; // solo eventos realmente frescos
+      if (q.dist > radiusKm) continue; // fuera del radio elegido
+
+      // Aviso en la barra de estado por CUALQUIER sismo nuevo dentro del radio.
+      if (_notifsReady) showQuakeNotification(_notifs, q);
+
       if (q.felt >= 4.5 || (q.mag >= 5 && q.dist < 300)) {
         _fireAlert(
           'Sismo M${q.mag.toStringAsFixed(1)} — ${q.place}',
           'A ${q.dist.round()} km de ti, ${timeAgo(q.time)}. Podrías sentirlo o recibir réplicas.',
         );
-      } else if (q.felt >= 2.5) {
-        _notify('Sismo M${q.mag.toStringAsFixed(1)} cerca de ti',
-            '${q.place} · a ${q.dist.round()} km · ${timeAgo(q.time)}');
-        _toast('🌐 Nuevo sismo M${q.mag.toStringAsFixed(1)} a ${q.dist.round()} km');
+      } else {
+        _toastQuake(q);
       }
     }
     firstLoad = false;
+  }
+
+  /// Aviso dentro de la app con acceso directo al mapa.
+  void _toastQuake(Quake q) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            '🌎 Sismo M${q.mag.toStringAsFixed(1)} a ${q.dist.round()} km · ${q.place}',
+          ),
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: kPanel2,
+          duration: const Duration(seconds: 6),
+          action: SnackBarAction(
+            label: 'Ver mapa',
+            textColor: kAccent,
+            onPressed: () => setState(() {
+              tab = 1;
+              selectedQuakeId = q.id;
+              mapFocus = MapFocus(q.lat, q.lon, ++_focusSeq);
+            }),
+          ),
+        ),
+      );
   }
 
   void _assessRisk() {
@@ -429,7 +789,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ---------------- Alertas ----------------
-  Future<void> _fireAlert(String title, String msg, {bool drill = false}) async {
+  Future<void> _fireAlert(
+    String title,
+    String msg, {
+    bool drill = false,
+  }) async {
     if (alertActive) return;
     setState(() {
       alertActive = true;
@@ -442,7 +806,8 @@ class _HomePageState extends State<HomePage> {
     try {
       if (await Vibration.hasVibrator()) {
         Vibration.vibrate(
-            pattern: [0, 400, 150, 400, 150, 800, 150, 400, 150, 800]);
+          pattern: [0, 400, 150, 400, 150, 800, 150, 400, 150, 800],
+        );
       }
     } catch (_) {}
   }
@@ -464,8 +829,10 @@ class _HomePageState extends State<HomePage> {
           return;
         }
         final p = await Geolocator.getCurrentPosition(
-            locationSettings:
-                const LocationSettings(accuracy: LocationAccuracy.medium));
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+          ),
+        );
         final name = await _placeName(p.latitude, p.longitude);
         if (!mounted) return;
         setState(() {
@@ -492,7 +859,17 @@ class _HomePageState extends State<HomePage> {
     firstLoad = true;
     knownIds.clear();
     setState(() => statusText = 'Actualizando…');
-    _fetchQuakes();
+    // El servicio en segundo plano usa la misma ubicación y filtros.
+    saveWatchConfig(
+      lat: lat,
+      lon: lon,
+      radiusKm: radiusKm,
+      minMag: minMag,
+      anonId: anonId,
+      servidorUrl: servidorUrl,
+    );
+    _registrarEnServidor();
+    _fetchQuakes(full: true);
   }
 
   // ---------------- UI ----------------
@@ -500,43 +877,58 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: Stack(children: [
-          Column(children: [
-            // En la pestaña Mapa (índice 1) el mapa ocupa toda la pantalla.
-            if (tab != 1) _header(),
-            if (tab != 1) _riskCard(),
-            Expanded(
-              child: IndexedStack(index: tab, children: [
-                RadarView(
-                  quakes: quakes,
-                  radiusKm: radiusKm,
-                  selectedId: selectedQuakeId,
-                  onSelect: (id) => setState(() => selectedQuakeId = id),
+        child: Stack(
+          children: [
+            Column(
+              children: [
+                // En la pestaña Mapa (índice 1) el mapa ocupa toda la pantalla.
+                if (tab != 1) _header(),
+                if (tab != 1) _riskCard(),
+                Expanded(
+                  child: IndexedStack(
+                    index: tab,
+                    children: [
+                      RadarView(
+                        quakes: quakes,
+                        radiusKm: radiusKm,
+                        selectedId: selectedQuakeId,
+                        onSelect: (id) => setState(() => selectedQuakeId = id),
+                      ),
+                      QuakeMapView(
+                        quakes: quakes,
+                        lat: lat,
+                        lon: lon,
+                        radiusKm: radiusKm,
+                        selectedId: selectedQuakeId,
+                        onSelect: (id) => setState(() => selectedQuakeId = id),
+                        focus: mapFocus,
+                      ),
+                      _quakeList(),
+                      SeismoView(
+                        bgWatchOn: bgWatchOn,
+                        onToggleBgWatch: _toggleBgWatch,
+                        serviceStatus: serviceStatus,
+                        onQuakeDetected: () {
+                          Servidor.enviarDeteccion(
+                            anonId: anonId,
+                            lat: lat,
+                            lon: lon,
+                          );
+                          _fireAlert(
+                            '¡VIBRACIÓN FUERTE DETECTADA!',
+                            'El acelerómetro de tu teléfono registró un movimiento sostenido compatible con un sismo. Protégete AHORA.',
+                          );
+                        },
+                      ),
+                      _guide(),
+                    ],
+                  ),
                 ),
-                QuakeMapView(
-                  quakes: quakes,
-                  lat: lat,
-                  lon: lon,
-                  radiusKm: radiusKm,
-                  selectedId: selectedQuakeId,
-                  onSelect: (id) => setState(() => selectedQuakeId = id),
-                ),
-                _quakeList(),
-                SeismoView(
-                  bgWatchOn: bgWatchOn,
-                  onToggleBgWatch: _toggleBgWatch,
-                  serviceStatus: serviceStatus,
-                  onQuakeDetected: () {
-                    _fireAlert('¡VIBRACIÓN FUERTE DETECTADA!',
-                        'El acelerómetro de tu teléfono registró un movimiento sostenido compatible con un sismo. Protégete AHORA.');
-                  },
-                ),
-                _guide(),
-              ]),
+              ],
             ),
-          ]),
-          if (alertActive) _alertOverlay(),
-        ]),
+            if (alertActive) _alertOverlay(),
+          ],
+        ),
       ),
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: tab,
@@ -547,10 +939,19 @@ class _HomePageState extends State<HomePage> {
         unselectedItemColor: kMuted,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.radar), label: 'Radar'),
-          BottomNavigationBarItem(icon: Icon(Icons.map_outlined), label: 'Mapa'),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.map_outlined),
+            label: 'Mapa',
+          ),
           BottomNavigationBarItem(icon: Icon(Icons.list_alt), label: 'Sismos'),
-          BottomNavigationBarItem(icon: Icon(Icons.show_chart), label: 'Sensor'),
-          BottomNavigationBarItem(icon: Icon(Icons.health_and_safety), label: 'Guía'),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.show_chart),
+            label: 'Sensor',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.health_and_safety),
+            label: 'Guía',
+          ),
         ],
       ),
     );
@@ -559,52 +960,74 @@ class _HomePageState extends State<HomePage> {
   Widget _header() {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-      child: Row(children: [
-        Container(
-          width: 38,
-          height: 38,
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(12),
-            gradient: const LinearGradient(
-                colors: [Color(0xFF0EA5E9), Color(0xFF6366F1)]),
+      child: Row(
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
+              gradient: const LinearGradient(
+                colors: [Color(0xFF0EA5E9), Color(0xFF6366F1)],
+              ),
+            ),
+            child: const Center(
+              child: Text('🌎', style: TextStyle(fontSize: 20)),
+            ),
           ),
-          child: const Center(child: Text('🌎', style: TextStyle(fontSize: 20))),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('Alerta Sísmica CO',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-            Row(children: [
-              Container(
-                width: 8,
-                height: 8,
-                decoration: BoxDecoration(
-                    shape: BoxShape.circle, color: online ? kSafe : kDanger),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(statusText,
-                    style: const TextStyle(fontSize: 11, color: kMuted),
-                    overflow: TextOverflow.ellipsis),
-              ),
-            ]),
-          ]),
-        ),
-        TextButton(
-          onPressed: _cycleCity,
-          style: TextButton.styleFrom(
-            backgroundColor: kPanel2,
-            shape: RoundedRectangleBorder(
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Alerta Sísmica CO',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+                ),
+                Row(
+                  children: [
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: online ? kSafe : kDanger,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Text(
+                        statusText,
+                        style: const TextStyle(fontSize: 11, color: kMuted),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: _cycleCity,
+            style: TextButton.styleFrom(
+              backgroundColor: kPanel2,
+              shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(10),
-                side: const BorderSide(color: kLine)),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          ),
-          child: Text('📍 $cityName',
+                side: const BorderSide(color: kLine),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            ),
+            child: Text(
+              '📍 $cityName',
               style: const TextStyle(
-                  fontSize: 12, fontWeight: FontWeight.w600, color: kText)),
-        ),
-      ]),
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                color: kText,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -639,21 +1062,39 @@ class _HomePageState extends State<HomePage> {
         borderRadius: BorderRadius.circular(16),
         color: kPanel,
         border: Border.all(color: color.withValues(alpha: .5)),
-        gradient: LinearGradient(colors: [color.withValues(alpha: .14), kPanel]),
-      ),
-      child: Row(children: [
-        Text(icon, style: const TextStyle(fontSize: 30)),
-        const SizedBox(width: 14),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title,
-                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800)),
-            const SizedBox(height: 2),
-            Text(detail,
-                style: const TextStyle(fontSize: 12, color: kMuted, height: 1.35)),
-          ]),
+        gradient: LinearGradient(
+          colors: [color.withValues(alpha: .14), kPanel],
         ),
-      ]),
+      ),
+      child: Row(
+        children: [
+          Text(icon, style: const TextStyle(fontSize: 30)),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  detail,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: kMuted,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -691,22 +1132,37 @@ class _HomePageState extends State<HomePage> {
               width: 44,
               height: 44,
               decoration: BoxDecoration(
-                  color: magColor(q.mag), borderRadius: BorderRadius.circular(12)),
+                color: magColor(q.mag),
+                borderRadius: BorderRadius.circular(12),
+              ),
               child: Center(
-                child: Text(q.mag.toStringAsFixed(1),
-                    style: const TextStyle(
-                        color: Color(0xFF0B1120), fontWeight: FontWeight.w800)),
+                child: Text(
+                  q.mag.toStringAsFixed(1),
+                  style: const TextStyle(
+                    color: Color(0xFF0B1120),
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
               ),
             ),
             title: Text(q.place, style: const TextStyle(fontSize: 13.5)),
             subtitle: Text(
-                '${timeAgo(q.time)} · prof. ${q.depth.round()} km · ${q.source}',
-                style: const TextStyle(fontSize: 11.5, color: kMuted)),
-            trailing: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-              Text('${q.dist.round()}',
-                  style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
-              const Text('km', style: TextStyle(fontSize: 10, color: kMuted)),
-            ]),
+              '${timeAgo(q.time)} · prof. ${q.depth.round()} km · ${q.source}',
+              style: const TextStyle(fontSize: 11.5, color: kMuted),
+            ),
+            trailing: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '${q.dist.round()}',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 15,
+                  ),
+                ),
+                const Text('km', style: TextStyle(fontSize: 10, color: kMuted)),
+              ],
+            ),
           ),
         );
       },
@@ -715,284 +1171,458 @@ class _HomePageState extends State<HomePage> {
 
   Widget _guide() {
     Widget card(String title, List<String> items) => Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: kPanel,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: kLine),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          for (final it in items)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('• ', style: TextStyle(color: kAccent)),
+                  Expanded(
+                    child: Text(
+                      it,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        color: kText,
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      children: [
+        Container(
+          margin: const EdgeInsets.only(bottom: 10, top: 4),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            gradient: LinearGradient(
+              colors: [kAccent.withValues(alpha: .15), kPanel],
+            ),
+            border: Border.all(color: kAccent.withValues(alpha: .4)),
+          ),
+          child: const Column(
+            children: [
+              Text(
+                'Si la tierra tiembla, recuerda:',
+                style: TextStyle(fontSize: 13),
+              ),
+              SizedBox(height: 6),
+              Text(
+                '🧎 AGÁCHATE · 🛡️ CÚBRETE · ✊ SUJÉTATE',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'La mayoría de las lesiones ocurren por objetos que caen, no por el derrumbe.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11.5, color: kMuted),
+              ),
+            ],
+          ),
+        ),
+        card('🎒 ANTES — prepárate hoy', [
+          'Arma un kit de emergencia: agua (3 días), linterna, pito, radio, botiquín, copia de documentos, pila externa.',
+          'Define con tu familia un punto de encuentro y un contacto fuera de la ciudad.',
+          'Identifica en casa las zonas seguras (bajo mesas firmes, junto a columnas) y las peligrosas (ventanas, estantes, fachadas).',
+          'Asegura a la pared muebles altos y el calentador de agua.',
+        ]),
+        card('⚡ DURANTE — los primeros 60 segundos', [
+          'Adentro: agáchate, cúbrete bajo una mesa firme y sujétate. NO corras a las escaleras ni uses el ascensor.',
+          'Afuera: aléjate de edificios, postes, cables y vidrios. Zonas abiertas.',
+          'En carro: detente en un lugar seguro, lejos de puentes y taludes (clave en la vía Bogotá–Villavicencio).',
+          'Si estás en zona de ladera, atento a deslizamientos después del sismo.',
+        ]),
+        card('🩹 DESPUÉS — evita la segunda tragedia', [
+          'Espera réplicas: pueden derribar estructuras ya dañadas.',
+          'Corta gas y electricidad si hueles gas o hay daños. No enciendas fósforos.',
+          'Evacúa por escaleras, con zapatos. Revisa grietas antes de reingresar.',
+          'Usa mensajes de texto, no llamadas, para no saturar la red.',
+          'Líneas en Colombia: Emergencias 123 · Cruz Roja 132 · Defensa Civil 144.',
+        ]),
+        Container(
           margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: kWatch.withValues(alpha: .5)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '🎓 Simulacro de sismo',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Practica tu reacción: la alarma sonará como en un sismo real y '
+                'mediremos cuánto tardas en ponerte a salvo. Ideal para practicar '
+                'en familia o en simulacros del colegio o del municipio.',
+                style: TextStyle(fontSize: 12, color: kMuted, height: 1.5),
+              ),
+              if (drillLast != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    '⏱️ Última reacción: ${drillLast!.toStringAsFixed(1)} s'
+                    '${drillBest != null ? '   ·   🏅 Mejor: ${drillBest!.toStringAsFixed(1)} s' : ''}',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700,
+                      color: kWatch,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: drillCountdown > 0 ? kPanel2 : kWatch,
+                    foregroundColor: drillCountdown > 0
+                        ? kText
+                        : const Color(0xFF0B1120),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  onPressed: _startDrill,
+                  child: Text(
+                    drillCountdown > 0
+                        ? 'La alarma sonará en $drillCountdown…'
+                        : '🚨 Iniciar simulacro',
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          margin: const EdgeInsets.only(bottom: 20),
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: kPanel,
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: kLine),
           ),
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title,
-                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 8),
-            for (final it in items)
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '⚙️ Ajustes de la app',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 10),
+              _settingRow(
+                '🔍 Radio de búsqueda',
+                DropdownButton<double>(
+                  value: radiusKm,
+                  dropdownColor: kPanel2,
+                  underline: const SizedBox(),
+                  items: const [300.0, 500.0, 1000.0, 2000.0]
+                      .map(
+                        (v) => DropdownMenuItem(
+                          value: v,
+                          child: Text('${v.round()} km'),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => radiusKm = v);
+                    _prefs?.setDouble('radius_km', v);
+                    _reload();
+                  },
+                ),
+              ),
+              _settingRow(
+                '📏 Magnitud mínima',
+                DropdownButton<double>(
+                  value: minMag,
+                  dropdownColor: kPanel2,
+                  underline: const SizedBox(),
+                  items: const [2.0, 2.5, 3.5, 4.5]
+                      .map(
+                        (v) => DropdownMenuItem(value: v, child: Text('M $v')),
+                      )
+                      .toList(),
+                  onChanged: (v) {
+                    if (v == null) return;
+                    setState(() => minMag = v);
+                    _prefs?.setDouble('min_mag', v);
+                    _reload();
+                  },
+                ),
+              ),
+              const SizedBox(height: 4),
+              InkWell(
+                onTap: _configurarServidor,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          '🛰️ Servidor de la plataforma',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                      ),
+                      Text(
+                        Servidor.activo
+                            ? (temaFcm != null
+                                  ? 'zona $temaFcm'
+                                  : 'configurado')
+                            : 'sin conectar',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Servidor.activo ? kSafe : kMuted,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const Icon(Icons.chevron_right, size: 18, color: kMuted),
+                    ],
+                  ),
+                ),
+              ),
               Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  const Text('• ', style: TextStyle(color: kAccent)),
-                  Expanded(
-                      child: Text(it,
-                          style: const TextStyle(
-                              fontSize: 12.5, color: kText, height: 1.4))),
-                ]),
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text('🔔 Avisos push',
+                          style: TextStyle(fontSize: 13)),
+                    ),
+                    Text(
+                      Push.activo
+                          ? (Push.temaSuscrito != null
+                              ? 'zona ${Push.temaSuscrito}'
+                              : 'activos')
+                          : (FirebaseConfig.configurado
+                              ? 'conectando…'
+                              : 'sin configurar'),
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: Push.activo ? kSafe : kMuted,
+                          fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
               ),
-          ]),
-        );
-
-    return ListView(padding: const EdgeInsets.symmetric(horizontal: 16), children: [
-      Container(
-        margin: const EdgeInsets.only(bottom: 10, top: 4),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          gradient: LinearGradient(colors: [kAccent.withValues(alpha: .15), kPanel]),
-          border: Border.all(color: kAccent.withValues(alpha: .4)),
-        ),
-        child: const Column(children: [
-          Text('Si la tierra tiembla, recuerda:', style: TextStyle(fontSize: 13)),
-          SizedBox(height: 6),
-          Text('🧎 AGÁCHATE · 🛡️ CÚBRETE · ✊ SUJÉTATE',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
-          SizedBox(height: 6),
-          Text('La mayoría de las lesiones ocurren por objetos que caen, no por el derrumbe.',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 11.5, color: kMuted)),
-        ]),
-      ),
-      card('🎒 ANTES — prepárate hoy', [
-        'Arma un kit de emergencia: agua (3 días), linterna, pito, radio, botiquín, copia de documentos, pila externa.',
-        'Define con tu familia un punto de encuentro y un contacto fuera de la ciudad.',
-        'Identifica en casa las zonas seguras (bajo mesas firmes, junto a columnas) y las peligrosas (ventanas, estantes, fachadas).',
-        'Asegura a la pared muebles altos y el calentador de agua.',
-      ]),
-      card('⚡ DURANTE — los primeros 60 segundos', [
-        'Adentro: agáchate, cúbrete bajo una mesa firme y sujétate. NO corras a las escaleras ni uses el ascensor.',
-        'Afuera: aléjate de edificios, postes, cables y vidrios. Zonas abiertas.',
-        'En carro: detente en un lugar seguro, lejos de puentes y taludes (clave en la vía Bogotá–Villavicencio).',
-        'Si estás en zona de ladera, atento a deslizamientos después del sismo.',
-      ]),
-      card('🩹 DESPUÉS — evita la segunda tragedia', [
-        'Espera réplicas: pueden derribar estructuras ya dañadas.',
-        'Corta gas y electricidad si hueles gas o hay daños. No enciendas fósforos.',
-        'Evacúa por escaleras, con zapatos. Revisa grietas antes de reingresar.',
-        'Usa mensajes de texto, no llamadas, para no saturar la red.',
-        'Líneas en Colombia: Emergencias 123 · Cruz Roja 132 · Defensa Civil 144.',
-      ]),
-      Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: kPanel,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: kWatch.withValues(alpha: .5)),
-        ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('🎓 Simulacro de sismo',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 6),
-          const Text(
-            'Practica tu reacción: la alarma sonará como en un sismo real y '
-            'mediremos cuánto tardas en ponerte a salvo. Ideal para practicar '
-            'en familia o en simulacros del colegio o del municipio.',
-            style: TextStyle(fontSize: 12, color: kMuted, height: 1.5),
-          ),
-          if (drillLast != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                '⏱️ Última reacción: ${drillLast!.toStringAsFixed(1)} s'
-                '${drillBest != null ? '   ·   🏅 Mejor: ${drillBest!.toStringAsFixed(1)} s' : ''}',
-                style: const TextStyle(
-                    fontSize: 12.5, fontWeight: FontWeight.w700, color: kWatch),
+              if (Servidor.activo)
+                InkWell(
+                  onTap: _abrirPanelMunicipal,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    child: Row(
+                      children: [
+                        const Expanded(
+                          child: Text('📊 Panel del municipio',
+                              style: TextStyle(fontSize: 13)),
+                        ),
+                        const Text('para autoridades',
+                            style: TextStyle(fontSize: 11.5, color: kMuted)),
+                        const SizedBox(width: 6),
+                        const Icon(Icons.open_in_new, size: 16, color: kMuted),
+                      ],
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 10),
+              const Text(
+                'Datos sísmicos combinados de tres catálogos: SGC (Servicio Geológico '
+                'Colombiano, fuente oficial del país), USGS (Servicio Geológico de EE.UU.) '
+                'y EMSC (Centro Sismológico Euro-Mediterráneo, con conexión en tiempo '
+                'real ⚡). Se actualizan cada 60 s y los duplicados se fusionan dando '
+                'prioridad al SGC. Esta app es una herramienta comunitaria de apoyo y '
+                'no reemplaza los canales oficiales.',
+                style: TextStyle(fontSize: 11, color: kMuted, height: 1.5),
               ),
-            ),
-          const SizedBox(height: 10),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: drillCountdown > 0 ? kPanel2 : kWatch,
-                foregroundColor:
-                    drillCountdown > 0 ? kText : const Color(0xFF0B1120),
-                padding: const EdgeInsets.symmetric(vertical: 12),
-              ),
-              onPressed: _startDrill,
-              child: Text(
-                drillCountdown > 0
-                    ? 'La alarma sonará en $drillCountdown…'
-                    : '🚨 Iniciar simulacro',
-                style:
-                    const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
-              ),
-            ),
+            ],
           ),
-        ]),
-      ),
-      Container(
-        margin: const EdgeInsets.only(bottom: 20),
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: kPanel,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: kLine),
         ),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('⚙️ Ajustes de la app',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
-          const SizedBox(height: 10),
-          _settingRow(
-            '🔍 Radio de búsqueda',
-            DropdownButton<double>(
-              value: radiusKm,
-              dropdownColor: kPanel2,
-              underline: const SizedBox(),
-              items: const [300.0, 500.0, 1000.0, 2000.0]
-                  .map((v) =>
-                      DropdownMenuItem(value: v, child: Text('${v.round()} km')))
-                  .toList(),
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() => radiusKm = v);
-                _prefs?.setDouble('radius_km', v);
-                _reload();
-              },
-            ),
+        Container(
+          margin: const EdgeInsets.only(bottom: 20),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: kLine),
           ),
-          _settingRow(
-            '📏 Magnitud mínima',
-            DropdownButton<double>(
-              value: minMag,
-              dropdownColor: kPanel2,
-              underline: const SizedBox(),
-              items: const [2.0, 2.5, 3.5, 4.5]
-                  .map((v) => DropdownMenuItem(value: v, child: Text('M $v')))
-                  .toList(),
-              onChanged: (v) {
-                if (v == null) return;
-                setState(() => minMag = v);
-                _prefs?.setDouble('min_mag', v);
-                _reload();
-              },
-            ),
-          ),
-          const SizedBox(height: 10),
-          const Text(
-            'Datos sísmicos combinados de tres catálogos: SGC (Servicio Geológico '
-            'Colombiano, fuente oficial del país), USGS (Servicio Geológico de EE.UU.) '
-            'y EMSC (Centro Sismológico Euro-Mediterráneo, con conexión en tiempo '
-            'real ⚡). Se actualizan cada 60 s y los duplicados se fusionan dando '
-            'prioridad al SGC. Esta app es una herramienta comunitaria de apoyo y '
-            'no reemplaza los canales oficiales.',
-            style: TextStyle(fontSize: 11, color: kMuted, height: 1.5),
-          ),
-        ]),
-      ),
-      Container(
-        margin: const EdgeInsets.only(bottom: 20),
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: kPanel,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: kLine),
-        ),
-        child: Row(children: [
-          Container(
-            width: 46,
-            height: 46,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              gradient: const LinearGradient(
-                  colors: [Color(0xFF0EA5E9), Color(0xFF6366F1)]),
-            ),
-            child: const Center(
-              child: Text('CEMG',
-                  style: TextStyle(
+          child: Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF0EA5E9), Color(0xFF6366F1)],
+                  ),
+                ),
+                child: const Center(
+                  child: Text(
+                    'CEMG',
+                    style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w800,
-                      color: Colors.white)),
-            ),
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '👨‍💻 Desarrollador',
+                      style: TextStyle(fontSize: 11, color: kMuted),
+                    ),
+                    const SizedBox(height: 2),
+                    const Text(
+                      'Carlos Eduardo Monroy Guzmán',
+                      style: TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    const Text(
+                      '📞 311 448 6732',
+                      style: TextStyle(fontSize: 12, color: kMuted),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '🔒 ID anónimo del dispositivo: $anonId',
+                      style: const TextStyle(fontSize: 10, color: kMuted),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('👨‍💻 Desarrollador',
-                  style: TextStyle(fontSize: 11, color: kMuted)),
-              const SizedBox(height: 2),
-              const Text('Carlos Eduardo Monroy Guzmán',
-                  style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w700)),
-              const SizedBox(height: 2),
-              const Text('📞 311 448 6732',
-                  style: TextStyle(fontSize: 12, color: kMuted)),
-              const SizedBox(height: 2),
-              Text('🔒 ID anónimo del dispositivo: $anonId',
-                  style: const TextStyle(fontSize: 10, color: kMuted)),
-            ]),
-          ),
-        ]),
-      ),
-    ]);
+        ),
+      ],
+    );
   }
 
   Widget _settingRow(String label, Widget control) => Padding(
-        padding: const EdgeInsets.only(bottom: 4),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [Text(label, style: const TextStyle(fontSize: 13)), control],
-        ),
-      );
+    padding: const EdgeInsets.only(bottom: 4),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(fontSize: 13)),
+        control,
+      ],
+    ),
+  );
 
   Widget _alertOverlay() {
     return Positioned.fill(
       child: Container(
         color: const Color(0xF20B1120),
         padding: const EdgeInsets.all(28),
-        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          if (alertIsDrill)
-            Container(
-              margin: const EdgeInsets.only(bottom: 10),
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-              decoration: BoxDecoration(
-                color: kWatch.withValues(alpha: .2),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(color: kWatch),
-              ),
-              child: const Text('🎓 SIMULACRO — ESTO ES UNA PRÁCTICA',
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (alertIsDrill)
+              Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: kWatch.withValues(alpha: .2),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: kWatch),
+                ),
+                child: const Text(
+                  '🎓 SIMULACRO — ESTO ES UNA PRÁCTICA',
                   style: TextStyle(
-                      fontSize: 12, fontWeight: FontWeight.w800, color: kWatch)),
-            ),
-          const Text('🚨', style: TextStyle(fontSize: 64)),
-          const SizedBox(height: 12),
-          Text(alertTitle,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                    color: kWatch,
+                  ),
+                ),
+              ),
+            const Text('🚨', style: TextStyle(fontSize: 64)),
+            const SizedBox(height: 12),
+            Text(
+              alertTitle,
               textAlign: TextAlign.center,
               style: const TextStyle(
-                  fontSize: 22, fontWeight: FontWeight.w800, color: kDanger)),
-          const SizedBox(height: 10),
-          Text(alertMsg,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 14, color: kText, height: 1.5)),
-          const SizedBox(height: 22),
-          const Text('🧎 AGÁCHATE\n🛡️ CÚBRETE\n✊ SUJÉTATE',
-              textAlign: TextAlign.center,
-              style:
-                  TextStyle(fontSize: 20, fontWeight: FontWeight.w800, height: 1.6)),
-          const SizedBox(height: 30),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: kDanger,
-              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                fontSize: 22,
+                fontWeight: FontWeight.w800,
+                color: kDanger,
+              ),
             ),
-            onPressed: () {
-              Vibration.cancel();
-              _stopSiren();
-              setState(() => alertActive = false);
-              _finishDrill();
-            },
-            child: const Text('Estoy a salvo',
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-          ),
-        ]),
+            const SizedBox(height: 10),
+            Text(
+              alertMsg,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 14, color: kText, height: 1.5),
+            ),
+            const SizedBox(height: 22),
+            const Text(
+              '🧎 AGÁCHATE\n🛡️ CÚBRETE\n✊ SUJÉTATE',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w800,
+                height: 1.6,
+              ),
+            ),
+            const SizedBox(height: 30),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: kDanger,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 32,
+                  vertical: 16,
+                ),
+              ),
+              onPressed: () {
+                Vibration.cancel();
+                _stopSiren();
+                setState(() => alertActive = false);
+                _finishDrill();
+              },
+              child: const Text(
+                'Estoy a salvo',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1023,8 +1653,10 @@ class _RadarViewState extends State<RadarView>
   @override
   void initState() {
     super.initState();
-    _ctrl = AnimationController(vsync: this, duration: const Duration(seconds: 4))
-      ..repeat();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 4),
+    )..repeat();
   }
 
   @override
@@ -1043,91 +1675,111 @@ class _RadarViewState extends State<RadarView>
   @override
   Widget build(BuildContext context) {
     final sel = _selected;
-    return Column(children: [
-      Expanded(
-        child: LayoutBuilder(builder: (context, box) {
-          final side = math.min(box.maxWidth, box.maxHeight);
-          return Center(
-            child: GestureDetector(
-              onTapUp: (d) {
-                final local = d.localPosition;
-                final blips = computeBlips(widget.quakes, widget.radiusKm, side);
-                RadarBlip? best;
-                var bd = double.infinity;
-                for (final b in blips) {
-                  final dist = (b.pos - local).distance;
-                  if (dist < math.max(b.size, 14) + 8 && dist < bd) {
-                    bd = dist;
-                    best = b;
-                  }
-                }
-                widget.onSelect(best?.quake.id);
-              },
-              child: AnimatedBuilder(
-                animation: _ctrl,
-                builder: (_, _) => CustomPaint(
-                  size: Size(side, side),
-                  painter: RadarPainter(
-                    quakes: widget.quakes,
-                    radiusKm: widget.radiusKm,
-                    sweep: _ctrl.value * 2 * math.pi,
-                    selectedId: widget.selectedId,
+    return Column(
+      children: [
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, box) {
+              final side = math.min(box.maxWidth, box.maxHeight);
+              return Center(
+                child: GestureDetector(
+                  onTapUp: (d) {
+                    final local = d.localPosition;
+                    final blips = computeBlips(
+                      widget.quakes,
+                      widget.radiusKm,
+                      side,
+                    );
+                    RadarBlip? best;
+                    var bd = double.infinity;
+                    for (final b in blips) {
+                      final dist = (b.pos - local).distance;
+                      if (dist < math.max(b.size, 14) + 8 && dist < bd) {
+                        bd = dist;
+                        best = b;
+                      }
+                    }
+                    widget.onSelect(best?.quake.id);
+                  },
+                  child: AnimatedBuilder(
+                    animation: _ctrl,
+                    builder: (_, _) => CustomPaint(
+                      size: Size(side, side),
+                      painter: RadarPainter(
+                        quakes: widget.quakes,
+                        radiusKm: widget.radiusKm,
+                        sweep: _ctrl.value * 2 * math.pi,
+                        selectedId: widget.selectedId,
+                      ),
+                    ),
                   ),
                 ),
-              ),
+              );
+            },
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.only(top: 4),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _LegendDot(color: kMagLow, label: 'M < 4'),
+              SizedBox(width: 14),
+              _LegendDot(color: kMagMid, label: 'M 4–5.5'),
+              SizedBox(width: 14),
+              _LegendDot(color: kMagHigh, label: 'M ≥ 5.5'),
+            ],
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.only(top: 4),
+          child: Text(
+            'Toca un punto del radar para ver detalles · Tú estás en el centro',
+            style: TextStyle(fontSize: 11, color: kMuted),
+          ),
+        ),
+        if (sel != null)
+          Container(
+            margin: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+            padding: const EdgeInsets.all(12),
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: kPanel,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: kLine),
             ),
-          );
-        }),
-      ),
-      const Padding(
-        padding: EdgeInsets.only(top: 4),
-        child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          _LegendDot(color: kMagLow, label: 'M < 4'),
-          SizedBox(width: 14),
-          _LegendDot(color: kMagMid, label: 'M 4–5.5'),
-          SizedBox(width: 14),
-          _LegendDot(color: kMagHigh, label: 'M ≥ 5.5'),
-        ]),
-      ),
-      const Padding(
-        padding: EdgeInsets.only(top: 4),
-        child: Text('Toca un punto del radar para ver detalles · Tú estás en el centro',
-            style: TextStyle(fontSize: 11, color: kMuted)),
-      ),
-      if (sel != null)
-        Container(
-          margin: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-          padding: const EdgeInsets.all(12),
-          width: double.infinity,
-          decoration: BoxDecoration(
-            color: kPanel,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: kLine),
-          ),
-          child: Text.rich(
-            TextSpan(children: [
+            child: Text.rich(
               TextSpan(
-                  text: 'M${sel.mag.toStringAsFixed(1)}',
-                  style: TextStyle(
-                      color: magColor(sel.mag), fontWeight: FontWeight.w800)),
-              TextSpan(text: ' — ${sel.place}\n'),
-              TextSpan(
-                  text:
-                      '📏 A ${sel.dist.round()} km de ti · Profundidad ${sel.depth.round()} km · ${timeAgo(sel.time)} · Fuente: ${sel.source}\n',
-                  style: const TextStyle(color: kMuted)),
-              TextSpan(
-                  text: sel.felt >= 4.5
-                      ? '⚠️ Probablemente se sintió fuerte en tu zona'
-                      : sel.felt >= 2.5
-                          ? '🔸 Pudo sentirse levemente en tu zona'
-                          : '✅ Imperceptible en tu ubicación'),
-            ]),
-            style: const TextStyle(fontSize: 13, height: 1.5),
-          ),
-        )
-      else
-        const SizedBox(height: 10),
-    ]);
+                children: [
+                  TextSpan(
+                    text: 'M${sel.mag.toStringAsFixed(1)}',
+                    style: TextStyle(
+                      color: magColor(sel.mag),
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  TextSpan(text: ' — ${sel.place}\n'),
+                  TextSpan(
+                    text:
+                        '📏 A ${sel.dist.round()} km de ti · Profundidad ${sel.depth.round()} km · ${timeAgo(sel.time)} · Fuente: ${sel.source}\n',
+                    style: const TextStyle(color: kMuted),
+                  ),
+                  TextSpan(
+                    text: sel.felt >= 4.5
+                        ? '⚠️ Probablemente se sintió fuerte en tu zona'
+                        : sel.felt >= 2.5
+                        ? '🔸 Pudo sentirse levemente en tu zona'
+                        : '✅ Imperceptible en tu ubicación',
+                  ),
+                ],
+              ),
+              style: const TextStyle(fontSize: 13, height: 1.5),
+            ),
+          )
+        else
+          const SizedBox(height: 10),
+      ],
+    );
   }
 }
 
@@ -1136,10 +1788,12 @@ class _LegendDot extends StatelessWidget {
   final String label;
   const _LegendDot({required this.color, required this.label});
   @override
-  Widget build(BuildContext context) => Row(children: [
-        Text('● ', style: TextStyle(color: color, fontSize: 11)),
-        Text(label, style: const TextStyle(fontSize: 11, color: kMuted)),
-      ]);
+  Widget build(BuildContext context) => Row(
+    children: [
+      Text('● ', style: TextStyle(color: color, fontSize: 11)),
+      Text(label, style: const TextStyle(fontSize: 11, color: kMuted)),
+    ],
+  );
 }
 
 class RadarBlip {
@@ -1189,15 +1843,28 @@ class RadarPainter extends CustomPainter {
     const rings = 4;
     for (var i = 1; i <= rings; i++) {
       canvas.drawCircle(c, maxR * i / rings, ringPaint);
-      _text(canvas, '${(radiusKm * i / rings).round()} km',
-          Offset(c.dx, c.dy - maxR * i / rings + 4), kMuted.withValues(alpha: .7), 10);
+      _text(
+        canvas,
+        '${(radiusKm * i / rings).round()} km',
+        Offset(c.dx, c.dy - maxR * i / rings + 4),
+        kMuted.withValues(alpha: .7),
+        10,
+      );
     }
     // Cruz
     final crossPaint = Paint()
       ..strokeWidth = 1
       ..color = kAccent.withValues(alpha: .10);
-    canvas.drawLine(Offset(c.dx - maxR, c.dy), Offset(c.dx + maxR, c.dy), crossPaint);
-    canvas.drawLine(Offset(c.dx, c.dy - maxR), Offset(c.dx, c.dy + maxR), crossPaint);
+    canvas.drawLine(
+      Offset(c.dx - maxR, c.dy),
+      Offset(c.dx + maxR, c.dy),
+      crossPaint,
+    );
+    canvas.drawLine(
+      Offset(c.dx, c.dy - maxR),
+      Offset(c.dx, c.dy + maxR),
+      crossPaint,
+    );
     _text(canvas, 'N', Offset(c.dx, c.dy - maxR - 4), kMuted, 11, bold: true);
 
     // Barrido
@@ -1226,7 +1893,10 @@ class RadarPainter extends CustomPainter {
         );
       }
       canvas.drawCircle(
-          b.pos, b.size, Paint()..color = magColor(q.mag).withValues(alpha: alpha));
+        b.pos,
+        b.size,
+        Paint()..color = magColor(q.mag).withValues(alpha: alpha),
+      );
       if (q.id == selectedId) {
         canvas.drawCircle(
           b.pos,
@@ -1252,15 +1922,23 @@ class RadarPainter extends CustomPainter {
     );
   }
 
-  void _text(Canvas canvas, String s, Offset center, Color color, double size,
-      {bool bold = false}) {
+  void _text(
+    Canvas canvas,
+    String s,
+    Offset center,
+    Color color,
+    double size, {
+    bool bold = false,
+  }) {
     final tp = TextPainter(
       text: TextSpan(
-          text: s,
-          style: TextStyle(
-              color: color,
-              fontSize: size,
-              fontWeight: bold ? FontWeight.w700 : FontWeight.w400)),
+        text: s,
+        style: TextStyle(
+          color: color,
+          fontSize: size,
+          fontWeight: bold ? FontWeight.w700 : FontWeight.w400,
+        ),
+      ),
       textDirection: TextDirection.ltr,
     )..layout();
     tp.paint(canvas, Offset(center.dx - tp.width / 2, center.dy));
@@ -1292,14 +1970,18 @@ class _SeismoViewState extends State<SeismoView> {
   bool on = false;
   final List<double> buf = [];
   final detector = StaLtaDetector(sampleRate: 50);
-  double peak = 0, current = 0, ratio = 0;
-  bool ready = false;
+  double peak = 0, current = 0, ratio = 0, stillSecs = 0, rate = 50;
+  bool ready = false, armed = false;
   StreamSubscription<UserAccelerometerEvent>? _sub;
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _gyroMag = 0;
 
   void _toggle() {
     if (on) {
       _sub?.cancel();
       _sub = null;
+      _gyroSub?.cancel();
+      _gyroSub = null;
       setState(() => on = false);
       return;
     }
@@ -1307,20 +1989,41 @@ class _SeismoViewState extends State<SeismoView> {
     peak = 0;
     ratio = 0;
     ready = false;
+    armed = false;
+    stillSecs = 0;
     detector.reset();
     try {
-      _sub = userAccelerometerEventStream(
-              samplingPeriod: const Duration(milliseconds: 20))
-          .listen(_onMotion, onError: (_) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text('Este dispositivo no tiene acelerómetro accesible')));
-        setState(() => on = false);
-      }, cancelOnError: true);
+      _gyroSub =
+          gyroscopeEventStream(
+            samplingPeriod: const Duration(milliseconds: 40),
+          ).listen((e) {
+            _gyroMag = math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
+          }, onError: (_) {});
+      _sub =
+          userAccelerometerEventStream(
+            samplingPeriod: const Duration(milliseconds: 20),
+          ).listen(
+            _onMotion,
+            onError: (_) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Este dispositivo no tiene acelerómetro accesible',
+                  ),
+                ),
+              );
+              setState(() => on = false);
+            },
+            cancelOnError: true,
+          );
       setState(() => on = true);
     } catch (_) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Este dispositivo no tiene acelerómetro accesible')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Este dispositivo no tiene acelerómetro accesible'),
+        ),
+      );
     }
   }
 
@@ -1329,7 +2032,7 @@ class _SeismoViewState extends State<SeismoView> {
   void _onMotion(UserAccelerometerEvent e) {
     // userAccelerometer ya excluye la gravedad: la magnitud es la vibración.
     final m = math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z);
-    final st = detector.process(m);
+    final st = detector.process(m, gyroMag: _gyroMag);
     buf.add(st.filtered.abs());
     if (buf.length > 400) buf.removeAt(0);
     if (st.sta > peak) peak = st.sta;
@@ -1340,18 +2043,23 @@ class _SeismoViewState extends State<SeismoView> {
       _lastVetoToast = DateTime.now();
       ScaffoldMessenger.of(context)
         ..hideCurrentSnackBar()
-        ..showSnackBar(SnackBar(
-          content: Text('🔨 Alarma descartada: ${st.veto}'),
-          behavior: SnackBarBehavior.floating,
-          backgroundColor: kPanel2,
-          duration: const Duration(seconds: 4),
-        ));
+        ..showSnackBar(
+          SnackBar(
+            content: Text('🔨 Alarma descartada: ${st.veto}'),
+            behavior: SnackBarBehavior.floating,
+            backgroundColor: kPanel2,
+            duration: const Duration(seconds: 4),
+          ),
+        );
     }
     if (mounted) {
       setState(() {
         current = st.sta;
         ratio = st.ratio;
         ready = st.ready;
+        armed = st.armed;
+        stillSecs = st.stillSeconds;
+        rate = st.measuredRate;
       });
     }
   }
@@ -1359,6 +2067,7 @@ class _SeismoViewState extends State<SeismoView> {
   @override
   void dispose() {
     _sub?.cancel();
+    _gyroSub?.cancel();
     super.dispose();
   }
 
@@ -1367,129 +2076,209 @@ class _SeismoViewState extends State<SeismoView> {
     final state = !on
         ? '—'
         : !ready
-            ? '⏳ Calibrando'
-            : ratio > 4
-                ? '🔴 FUERTE'
-                : ratio > 2
-                    ? '🟡 Vibrando'
-                    : '🟢 Estable';
-    return ListView(padding: const EdgeInsets.symmetric(horizontal: 16), children: [
-      const Padding(
-        padding: EdgeInsets.symmetric(vertical: 8),
-        child: Text('SISMÓGRAFO — SENSORES DE TU TELÉFONO',
+        ? '⏳ Calibrando'
+        : !armed
+        ? '✋ En uso'
+        : ratio > 4
+        ? '🔴 FUERTE'
+        : ratio > 2
+        ? '🟡 Vibrando'
+        : '🟢 Vigilando';
+    return ListView(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 8),
+          child: Text(
+            'SISMÓGRAFO — SENSORES DE TU TELÉFONO',
             style: TextStyle(
-                fontSize: 12,
-                color: kMuted,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 1)),
-      ),
-      // Vigilancia 24/7 en segundo plano
-      Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
-        decoration: BoxDecoration(
-          color: kPanel,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-              color: widget.bgWatchOn ? kSafe.withValues(alpha: .5) : kLine),
+              fontSize: 12,
+              color: kMuted,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1,
+            ),
+          ),
         ),
-        child: Column(children: [
-          Row(children: [
-            Expanded(
-              child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('🛰️ Vigilancia 24/7 en segundo plano',
+        // Vigilancia 24/7 en segundo plano
+        Container(
+          margin: const EdgeInsets.only(bottom: 10),
+          padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+          decoration: BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: widget.bgWatchOn ? kSafe.withValues(alpha: .5) : kLine,
+            ),
+          ),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          '🛰️ Vigilancia 24/7 en segundo plano',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          widget.bgWatchOn
+                              ? 'El detector sigue activo con la pantalla apagada.'
+                              : 'Sigue detectando aunque cierres la app o se apague la pantalla.',
+                          style: const TextStyle(fontSize: 11.5, color: kMuted),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch(
+                    value: widget.bgWatchOn,
+                    activeTrackColor: kSafe,
+                    onChanged: widget.onToggleBgWatch,
+                  ),
+                ],
+              ),
+              if (widget.bgWatchOn)
+                ValueListenableBuilder<String>(
+                  valueListenable: widget.serviceStatus,
+                  builder: (_, txt, _) => txt.isEmpty
+                      ? const SizedBox.shrink()
+                      : Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(
+                            txt,
+                            style: const TextStyle(fontSize: 11, color: kSafe),
+                          ),
+                        ),
+                ),
+            ],
+          ),
+        ),
+        Container(
+          height: 180,
+          decoration: BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: kLine),
+          ),
+          child: CustomPaint(
+            size: const Size(double.infinity, 180),
+            painter: SeismoPainter(buf),
+          ),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            _gauge(current.toStringAsFixed(3), 'Vibración m/s²'),
+            const SizedBox(width: 8),
+            _gauge(ratio.toStringAsFixed(1), 'STA/LTA'),
+            const SizedBox(width: 8),
+            _gauge(state, 'Estado'),
+          ],
+        ),
+        const SizedBox(height: 10),
+        // Estado de armado: la clave para que no alerte con cualquier movimiento.
+        if (on)
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: kPanel,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: armed
+                    ? kSafe.withValues(alpha: .55)
+                    : kWatch.withValues(alpha: .55),
+              ),
+            ),
+            child: Row(
+              children: [
+                Text(armed ? '🛡️' : '✋', style: const TextStyle(fontSize: 22)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        armed
+                            ? 'ARMADO — el teléfono está quieto y vigilando'
+                            : 'EN USO — no vigila mientras lo mueves',
                         style: TextStyle(
-                            fontSize: 13.5, fontWeight: FontWeight.w700)),
-                    const SizedBox(height: 2),
-                    Text(
-                      widget.bgWatchOn
-                          ? 'El detector sigue activo con la pantalla apagada.'
-                          : 'Sigue detectando aunque cierres la app o se apague la pantalla.',
-                      style: const TextStyle(fontSize: 11.5, color: kMuted),
-                    ),
-                  ]),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          color: armed ? kSafe : kWatch,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        armed
+                            ? 'Quieto hace ${stillSecs.round()} s · sensor a ${rate.round()} Hz'
+                            : 'Déjalo quieto sobre una superficie firme: se arma en '
+                                  '${(45 - stillSecs).clamp(0, 45).round()} s',
+                        style: const TextStyle(fontSize: 11, color: kMuted),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
-            Switch(
-              value: widget.bgWatchOn,
-              activeTrackColor: kSafe,
-              onChanged: widget.onToggleBgWatch,
-            ),
-          ]),
-          if (widget.bgWatchOn)
-            ValueListenableBuilder<String>(
-              valueListenable: widget.serviceStatus,
-              builder: (_, txt, _) => txt.isEmpty
-                  ? const SizedBox.shrink()
-                  : Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: Text(txt,
-                          style: const TextStyle(fontSize: 11, color: kSafe)),
-                    ),
-            ),
-        ]),
-      ),
-      Container(
-        height: 180,
-        decoration: BoxDecoration(
-          color: kPanel,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: kLine),
+          ),
+        const SizedBox(height: 12),
+        const Text(
+          'Apoya el teléfono sobre una mesa o el suelo y actívalo. Igual que la red '
+          'de detección de Google en Android, el sismógrafo solo vigila cuando el '
+          'teléfono lleva un rato QUIETO: caminar o tenerlo en la mano produce '
+          'oscilaciones de 1–3 Hz idénticas a una onda sísmica, así que la única '
+          'forma seria de no dar falsas alarmas es no vigilar mientras se usa.\n\n'
+          'Cuando está armado, el detector trabaja en dos etapas: el algoritmo '
+          'sismológico STA/LTA con filtro pasa-banda (0.4–5 Hz) marca los candidatos, '
+          'y un clasificador estilo MyShake (UC Berkeley) descarta lo que no es sismo: '
+          'giroscopio (si el teléfono rota, alguien lo está manipulando), golpes secos '
+          '(factor de cresta), objetos vibrando (cruces por cero y energía de alta '
+          'frecuencia) y falta de reposo previo.',
+          style: TextStyle(fontSize: 12, color: kMuted, height: 1.5),
         ),
-        child: CustomPaint(
-            size: const Size(double.infinity, 180), painter: SeismoPainter(buf)),
-      ),
-      const SizedBox(height: 10),
-      Row(children: [
-        _gauge(current.toStringAsFixed(3), 'Vibración m/s²'),
-        const SizedBox(width: 8),
-        _gauge(ratio.toStringAsFixed(1), 'STA/LTA'),
-        const SizedBox(width: 8),
-        _gauge(state, 'Estado'),
-      ]),
-      const SizedBox(height: 12),
-      const Text(
-        'Apoya el teléfono sobre una mesa o el suelo y activa el sensor. '
-        'El detector trabaja en dos etapas: primero el algoritmo sismológico STA/LTA '
-        'con filtro pasa-banda (0.4–5 Hz) marca los candidatos, y luego un clasificador '
-        'estilo MyShake (UC Berkeley) descarta lo que no es sismo: golpes secos '
-        '(factor de cresta), objetos vibrando (cruces por cero y energía de alta '
-        'frecuencia) y manipulación del teléfono (reposo previo). '
-        'Así funciona también la red de detección de Google en Android.',
-        style: TextStyle(fontSize: 12, color: kMuted, height: 1.5),
-      ),
-      const SizedBox(height: 14),
-      FilledButton(
-        style: FilledButton.styleFrom(
-          backgroundColor: on ? kPanel2 : kAccent,
-          foregroundColor: on ? kText : const Color(0xFF0B1120),
-          padding: const EdgeInsets.symmetric(vertical: 14),
+        const SizedBox(height: 14),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: on ? kPanel2 : kAccent,
+            foregroundColor: on ? kText : const Color(0xFF0B1120),
+            padding: const EdgeInsets.symmetric(vertical: 14),
+          ),
+          onPressed: _toggle,
+          child: Text(
+            on ? '⏸️ Detener sismógrafo' : '▶️ Activar sismógrafo',
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+          ),
         ),
-        onPressed: _toggle,
-        child: Text(on ? '⏸️ Detener sismógrafo' : '▶️ Activar sismógrafo',
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
-      ),
-      const SizedBox(height: 20),
-    ]);
+        const SizedBox(height: 20),
+      ],
+    );
   }
 
   Widget _gauge(String value, String label) => Expanded(
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          decoration: BoxDecoration(
-            color: kPanel,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: kLine),
+    child: Container(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      decoration: BoxDecoration(
+        color: kPanel,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: kLine),
+      ),
+      child: Column(
+        children: [
+          Text(
+            value,
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800),
           ),
-          child: Column(children: [
-            Text(value,
-                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
-            const SizedBox(height: 2),
-            Text(label, style: const TextStyle(fontSize: 10, color: kMuted)),
-          ]),
-        ),
-      );
+          const SizedBox(height: 2),
+          Text(label, style: const TextStyle(fontSize: 10, color: kMuted)),
+        ],
+      ),
+    ),
+  );
 }
 
 class SeismoPainter extends CustomPainter {
@@ -1506,8 +2295,11 @@ class SeismoPainter extends CustomPainter {
     for (double y = 0; y < h; y += 30) {
       canvas.drawLine(Offset(0, y), Offset(w, y), grid);
     }
-    canvas.drawLine(Offset(0, h / 2), Offset(w, h / 2),
-        Paint()..color = kMuted.withValues(alpha: .25));
+    canvas.drawLine(
+      Offset(0, h / 2),
+      Offset(w, h / 2),
+      Paint()..color = kMuted.withValues(alpha: .25),
+    );
     // Forma de onda espejada alrededor del centro, como un sismograma
     if (buf.length > 1) {
       final path = Path();

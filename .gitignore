@@ -1,15 +1,79 @@
-# === Sistema operativo / editores ===
+# ============================================================
+#  CREDENCIALES — nada de esto puede salir del computador
+# ============================================================
+# Regla de oro: si un archivo contiene una clave, va aquí ANTES de existir.
+# Un secreto confirmado en git no se borra con un commit posterior: queda en
+# el historial para siempre y hay que rotarlo, no basta con quitarlo.
+
+# Variables de entorno y secretos del servidor
+.env
+.env.*
+!.env.ejemplo
+.dev.vars
+.dev.vars.*
+!.dev.vars.ejemplo
+secrets.*
+*.secret
+
+# Claves privadas y certificados
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.asc
+*.gpg
+id_rsa*
+
+# Cuentas de servicio de Google / Firebase (¡la clave que firma los envíos!)
+*adminsdk*.json
+*service-account*.json
+*serviceaccount*.json
+firebase-adminsdk-*.json
+
+# Configuración de cliente de Firebase. No es un secreto criptográfico
+# —viaja dentro del APK— pero se mantiene fuera para no exponer el proyecto
+# a consumo ajeno. Los valores se inyectan al compilar desde claves.env.
+google-services.json
+GoogleService-Info.plist
+
+# Valores propios de cada despliegue (URL del servidor + Firebase)
+claves.env
+
+# Firma de Android para publicar en Play Store
+*.jks
+*.keystore
+key.properties
+android/key.properties
+upload-keystore.*
+
+# Credenciales de nube
+.wrangler/
+.cloudflared/
+.aws/
+.gcloud/
+gha-creds-*.json
+
+# ============================================================
+#  Sistema operativo / editores
+# ============================================================
 .DS_Store
 Thumbs.db
+desktop.ini
 *.log
 *.swp
+*~
 .vscode/
 .idea/
+*.iml
 
-# === Node (servidor local de pruebas) ===
+# ============================================================
+#  Dependencias y resultados de compilar
+# ============================================================
 node_modules/
 npm-debug.log*
+yarn-error.log
 
-# Nota: app_flutter/ y app_flutter/android/ tienen su propio .gitignore
-# generado por Flutter para excluir build/, .dart_tool/, .gradle/,
-# local.properties, keystores, etc.
+# Nota: app_flutter/ y app_flutter/android/ tienen además el .gitignore que
+# genera Flutter (build/, .dart_tool/, .gradle/, local.properties…), y
+# server/ tiene el suyo para el panel compilado.

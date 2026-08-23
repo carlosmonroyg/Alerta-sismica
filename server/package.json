@@ -1,0 +1,16 @@
+{
+  "name": "alerta-sismica-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Servidor de recolección, consenso y alertas de Alerta Sísmica CO",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 execute alerta_sismica --local --file=./schema.sql",
+    "db:remoto": "wrangler d1 execute alerta_sismica --remote --file=./schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.42.0"
+  },
+  "type": "module"
+}
