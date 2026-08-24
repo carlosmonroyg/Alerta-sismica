@@ -273,27 +273,35 @@ async function despacharPendientes(env) {
     // terminara la difusión general.
     let directo = null;
     if (fuerte) {
-      const cercanos = await dispositivosCercanos(env, s.lat, s.lon, radio);
+      const cercanos = await dispositivosCercanos(env, s.lat, s.lon, radio, s.mag);
       directo = await enviarADispositivos(env, cercanos.map((d) => d.token), {
         datos,
         urgente: true,
       });
     }
 
-    // Detalle decisivo: si el mensaje lleva carga de "notificación", la dibuja
-    // Android y NO puede ser de pantalla completa. Para que un sismo fuerte se
-    // apodere de la pantalla hay que mandar SOLO datos y dejar que la app
-    // construya la alerta. Para los avisos informativos conviene lo contrario:
-    // con carga de notificación se muestran aunque la app no pueda ejecutarse.
+    // SOLO DATOS, NUNCA CARGA DE "NOTIFICACIÓN".
+    //
+    // Si el mensaje trae carga de notificación, la dibuja Android antes de que
+    // la app se entere: no puede ser de pantalla completa y —lo que rompía el
+    // ajuste— TAMPOCO puede filtrarse. Una zona mide ~111 km y dentro de ella
+    // conviven usuarios con magnitudes mínimas distintas, así que el servidor
+    // no puede decidir por ellos: quien puso el umbral en M3.5 recibía igual
+    // todos los sismos. Mandando solo datos, el filtro lo aplica el teléfono
+    // (ver sismoPasaElFiltro en app_flutter/lib/core.dart).
+    //
+    // A cambio se pierde el aviso si el usuario forzó la detención de la app
+    // desde los ajustes de Android: ahí el sistema no deja que se ejecute nada
+    // nuestro. Es el precio de que el ajuste signifique algo.
     const envio = await enviarAZonas(env, zonas, {
       datos,
-      notificacion: fuerte
-          ? null
-          : {
-              title: "🌎 Sismo M" + s.mag.toFixed(1) + " — " + s.lugar,
-              body: "Toca para verlo en el mapa.",
-            },
-      urgente: fuerte,
+      notificacion: null,
+      // SIEMPRE prioridad alta. Con prioridad "normal" Android retiene el
+      // mensaje mientras el teléfono está en reposo (Doze) y lo entrega al
+      // salir de él: el usuario veía el sismo recién al desbloquear, a veces
+      // horas después. Un aviso sísmico es exactamente el caso de uso que FCM
+      // contempla para la prioridad alta.
+      urgente: true,
     });
 
     // La limpieza de tokens muertos va al final: no debe retrasar el aviso.
@@ -315,10 +323,11 @@ async function despacharPendientes(env) {
  * sismo. La distancia se calcula desde el centro de su celda —nunca se guarda
  * la ubicación exacta—, así que es aproximada a unos 28 km.
  */
-async function dispositivosCercanos(env, lat, lon, radioKm) {
+async function dispositivosCercanos(env, lat, lon, radioKm, mag = null) {
   const tope = Number(env.MAX_ENVIO_DIRECTO ?? 40);
   const { results } = await env.DB.prepare(
-    "SELECT id, token, celda FROM dispositivos WHERE token IS NOT NULL"
+    "SELECT id, token, celda, radio_km, min_mag FROM dispositivos" +
+    " WHERE token IS NOT NULL"
   ).all();
 
   return (results ?? [])
@@ -327,6 +336,11 @@ async function dispositivosCercanos(env, lat, lon, radioKm) {
       return { ...d, dist: haversineKm(lat, lon, c.lat, c.lon) };
     })
     .filter((d) => d.dist <= radioKm)
+    // Cada teléfono dejó registrados SUS ajustes al darse de alta: respetarlos
+    // aquí es gratis y evita gastar los envíos directos —que son pocos y van
+    // primero— en gente que de todos modos iba a descartar el aviso.
+    .filter((d) => d.dist <= (d.radio_km ?? radioKm))
+    .filter((d) => mag === null || mag >= (d.min_mag ?? 0))
     .sort((a, b) => a.dist - b.dist)
     .slice(0, tope);
 }
@@ -362,14 +376,19 @@ async function listarSismos(url, env) {
   const lat = num(url.searchParams.get("lat"));
   const lon = num(url.searchParams.get("lon"));
   const radio = num(url.searchParams.get("radio"), 500);
+  // La magnitud mínima que eligió el usuario. Se filtra en SQL y no después,
+  // para que el LIMIT no se gaste en micro-sismos que la app va a descartar:
+  // con el umbral en M3.5 el límite de 500 se llenaba de eventos M1.x y los
+  // sismos que sí importan quedaban fuera de la lista.
+  const magMin = num(url.searchParams.get("mag"), 0);
   const dias = Math.min(num(url.searchParams.get("dias"), 7), 30);
   const desde = Date.now() - dias * 86400000;
 
   const { results } = await env.DB.prepare(
     "SELECT id, fuente, mag, lat, lon, prof, lugar, ocurrio FROM sismos" +
-    " WHERE ocurrio > ?1 AND fuente <> 'COMUNIDAD'" +
+    " WHERE ocurrio > ?1 AND fuente <> 'COMUNIDAD' AND mag >= ?2" +
     " ORDER BY ocurrio DESC LIMIT 500"
-  ).bind(desde).all();
+  ).bind(desde, magMin).all();
 
   let lista = results ?? [];
   if (lat !== null && lon !== null) {
