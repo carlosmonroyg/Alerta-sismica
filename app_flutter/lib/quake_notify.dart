@@ -1,10 +1,11 @@
 // Notificaciones de sismos en la barra de estado.
 //
-// Se usan desde dos isolates distintos: la app (cuando está abierta) y el
-// servicio de vigilancia 24/7 (cuando está cerrada). Ambas comparten el mismo
-// id de notificación por sismo, de modo que Android nunca muestra el mismo
-// evento dos veces. El payload lleva los datos del epicentro para que, al
-// tocar la notificación, la app abra el mapa centrado en él.
+// Se usan desde tres isolates distintos: la app (cuando está abierta), el
+// servicio de vigilancia 24/7 (cuando está cerrada) y el que atiende los
+// avisos push. Los tres comparten el mismo id de notificación por sismo, de
+// modo que Android nunca muestra el mismo evento dos veces. El payload lleva
+// los datos del epicentro para que, al tocar la notificación, la app abra el
+// mapa centrado en él.
 
 import 'dart:convert';
 import 'dart:ui' show Color;
@@ -13,12 +14,27 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import 'core.dart';
 
-// Canal propio (no reutiliza el de versiones anteriores: Android no permite
-// renombrar un canal ya creado en el dispositivo).
-const kQuakeChannelId = 'sismos_cerca';
-const kQuakeChannelName = 'Sismos cerca de ti';
+// LA IMPORTANCIA SE FIJA AL CREAR EL CANAL Y ANDROID IGNORA CUALQUIER CAMBIO
+// POSTERIOR. Por eso cada nivel de urgencia necesita SU PROPIO canal: antes se
+// usaba uno solo al que se le pasaba una importancia distinta según el sismo,
+// y el sistema se quedaba con la del primer aviso mostrado tras instalar. Si
+// ese primero era un sismo imperceptible, TODOS los avisos posteriores
+// —incluidos los que sí se sienten— quedaban mudos y sin asomarse a la
+// pantalla: el usuario solo los descubría al desbloquear el teléfono.
+
+/// Sismos con intensidad estimada suficiente para sentirse. Suenan y asoman.
+const kQuakeChannelId = 'sismos_sentidos';
+const kQuakeChannelName = 'Sismos que puedes sentir';
 const kQuakeChannelDesc =
-    'Aviso en la barra de estado cuando ocurre un sismo dentro del radio elegido';
+    'Aviso con sonido cuando un sismo pudo llegar a sentirse en tu ubicación.';
+
+/// Sismos dentro del radio elegido pero demasiado pequeños o lejanos para
+/// notarse. Se dejan en la cortina sin sonido: son información, no un aviso.
+const kQuakeInfoChannelId = 'sismos_lejanos';
+const kQuakeInfoChannelName = 'Sismos imperceptibles';
+const kQuakeInfoChannelDesc =
+    'Sismos dentro de tu radio de búsqueda que no alcanzan a sentirse. '
+    'Aparecen en la cortina, en silencio.';
 
 // Canal aparte para lo que sí es una emergencia. Va separado porque los
 // ajustes de un canal (sonido de alarma, importancia máxima) se fijan al
@@ -30,6 +46,39 @@ const kEmergenciaChannelDesc =
     'Sismos que pueden sentirse con fuerza en tu ubicación. Se muestran a '
     'pantalla completa, con sonido de alarma, incluso con el teléfono '
     'bloqueado o en silencio.';
+
+/// Declara los tres canales por adelantado.
+///
+/// No basta con que `show` los cree al vuelo: un aviso dirigido a un canal que
+/// todavía no existe lo descarta Android sin mostrarlo, y el primer sismo que
+/// recibe un teléfono recién instalado suele llegar por push, antes de que la
+/// app haya mostrado nada por su cuenta.
+Future<void> crearCanalesDeSismo(FlutterLocalNotificationsPlugin plugin) async {
+  final android = plugin.resolvePlatformSpecificImplementation<
+      AndroidFlutterLocalNotificationsPlugin>();
+  if (android == null) return;
+  await android.createNotificationChannel(const AndroidNotificationChannel(
+    kEmergenciaChannelId,
+    kEmergenciaChannelName,
+    description: kEmergenciaChannelDesc,
+    importance: Importance.max,
+    audioAttributesUsage: AudioAttributesUsage.alarm,
+  ));
+  await android.createNotificationChannel(const AndroidNotificationChannel(
+    kQuakeChannelId,
+    kQuakeChannelName,
+    description: kQuakeChannelDesc,
+    importance: Importance.high,
+  ));
+  await android.createNotificationChannel(const AndroidNotificationChannel(
+    kQuakeInfoChannelId,
+    kQuakeInfoChannelName,
+    description: kQuakeInfoChannelDesc,
+    importance: Importance.low,
+    playSound: false,
+    enableVibration: false,
+  ));
+}
 
 /// Id estable por sismo: dos avisos del mismo evento se reemplazan en vez
 /// de acumularse en la cortina de notificaciones.
@@ -125,18 +174,34 @@ Future<void> showQuakeNotification(
               contentTitle: title,
             ),
           )
-        : AndroidNotificationDetails(
-            kQuakeChannelId,
-            kQuakeChannelName,
-            channelDescription: kQuakeChannelDesc,
-            importance: sentido ? Importance.high : Importance.defaultImportance,
-            priority: sentido ? Priority.high : Priority.defaultPriority,
-            ticker: title,
-            styleInformation: BigTextStyleInformation(
-              cuerpo.toString(),
-              contentTitle: title,
-            ),
-          ),
+        : sentido
+            ? AndroidNotificationDetails(
+                kQuakeChannelId,
+                kQuakeChannelName,
+                channelDescription: kQuakeChannelDesc,
+                importance: Importance.high,
+                priority: Priority.high,
+                visibility: NotificationVisibility.public,
+                ticker: title,
+                styleInformation: BigTextStyleInformation(
+                  cuerpo.toString(),
+                  contentTitle: title,
+                ),
+              )
+            : AndroidNotificationDetails(
+                kQuakeInfoChannelId,
+                kQuakeInfoChannelName,
+                channelDescription: kQuakeInfoChannelDesc,
+                importance: Importance.low,
+                priority: Priority.low,
+                playSound: false,
+                enableVibration: false,
+                ticker: title,
+                styleInformation: BigTextStyleInformation(
+                  cuerpo.toString(),
+                  contentTitle: title,
+                ),
+              ),
   );
 
   await plugin.show(
