@@ -102,6 +102,7 @@ class Servidor {
     required double lat,
     required double lon,
     required double radiusKm,
+    required double minMag,
     int dias = 7,
   }) async {
     if (!activo) return null;
@@ -110,12 +111,16 @@ class Servidor {
         'lat': lat.toStringAsFixed(4),
         'lon': lon.toStringAsFixed(4),
         'radio': radiusKm.round().toString(),
+        'mag': minMag.toString(),
         'dias': dias.toString(),
       })).timeout(_timeout);
       if (r.statusCode != 200) return null;
       final j = jsonDecode(r.body) as Map<String, dynamic>;
       final lista = (j['sismos'] as List).cast<Map<String, dynamic>>();
       return lista
+          // Defensa por si el servidor es de una versión anterior y no
+          // entiende el parámetro `mag`: el filtro del usuario manda igual.
+          .where((s) => ((s['mag'] as num?)?.toDouble() ?? 0) >= minMag)
           .map((s) => Quake.at(
                 id: s['id'] as String,
                 mag: (s['mag'] as num).toDouble(),
