@@ -6,7 +6,10 @@
 // necesita un servicio en primer plano para enterarse de un sismo.
 //
 // El servidor es quien mantiene el WebSocket del EMSC y consulta los catálogos
-// —una sola vez para todos— y despacha el aviso a la ZONA afectada.
+// —una sola vez para todos— y despacha el aviso a la ZONA afectada. Una zona
+// mide ~111 km: dentro de ella caben usuarios con radios y magnitudes mínimas
+// muy distintas, así que EL FILTRO FINAL LO APLICA SIEMPRE EL TELÉFONO, tanto
+// con la app abierta como con la app cerrada.
 //
 // Todo esto es opcional: si el proyecto de Firebase no está configurado
 // (ver firebase_config.dart), la app sigue funcionando como siempre.
@@ -40,6 +43,7 @@ Future<void> manejarMensajeEnSegundoPlano(RemoteMessage mensaje) async {
     await notifs.initialize(const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ));
+    await crearCanalesDeSismo(notifs);
 
     // Este isolate arranca en frío: no hereda nada de la app. Sin recuperar la
     // última ubicación conocida, la distancia se calcularía desde el punto
@@ -47,6 +51,7 @@ Future<void> manejarMensajeEnSegundoPlano(RemoteMessage mensaje) async {
     final prefs = await SharedPreferences.getInstance();
     final lat = prefs.getDouble(kPrefUltLat) ?? 0;
     final lon = prefs.getDouble(kPrefUltLon) ?? 0;
+    final conUbicacion = lat != 0 || lon != 0;
 
     final q = Push.sismoDesdeMensaje(mensaje.data, lat, lon);
     if (q == null) return;
@@ -54,7 +59,21 @@ Future<void> manejarMensajeEnSegundoPlano(RemoteMessage mensaje) async {
     // El servidor ya juzgó la severidad; si además conocemos la ubicación,
     // basta con que cualquiera de los dos criterios la considere grave.
     final delServidor = '${mensaje.data['emergencia']}' == '1';
-    final grave = delServidor || (lat != 0 && q.felt >= 4.5);
+    final grave = delServidor || (conUbicacion && q.felt >= 4.5);
+
+    // El servidor difunde a toda la zona (~111 km) sin saber qué configuró
+    // cada quien. Sin este filtro, subir la magnitud mínima a M3.5 no servía
+    // de nada con la app cerrada: seguían llegando TODOS los sismos.
+    if (!sismoPasaElFiltro(
+      q,
+      minMag: prefs.getDouble(kPrefMinMag) ?? kMinMagPorDefecto,
+      radioKm: prefs.getDouble(kPrefRadiusKm) ?? kRadiusKmPorDefecto,
+      emergencia: grave,
+      conUbicacion: conUbicacion,
+    )) {
+      return;
+    }
+
     await showQuakeNotification(notifs, q, emergencia: grave);
   } catch (_) {
     // Nunca dejar caer el manejador: perderíamos avisos posteriores.
