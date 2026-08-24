@@ -116,13 +116,21 @@ export async function enviarAZonas(env, zonas, { datos, notificacion, urgente })
       const mensaje = {
         condition: condicionDe(grupo),
         // Datos siempre: la app decide si mostrar la alerta según el radio y
-        // la magnitud mínima que configuró el usuario.
+        // la magnitud mínima que configuró el usuario. Añadir carga de
+        // "notificación" le quita esa decisión —Android la dibuja solo—, así
+        // que se reserva para lo que no depende de un umbral de magnitud: el
+        // consenso comunitario y los simulacros.
         data: Object.fromEntries(
           Object.entries(datos).map(([k, v]) => [k, String(v)])
         ),
         android: {
           priority: urgente ? "high" : "normal",
-          ...(notificacion ? { notification: { channel_id: "sismos_cerca" } } : {}),
+          // Debe existir en el teléfono: lo declara crearCanalesDeSismo()
+          // en app_flutter/lib/quake_notify.dart. Un canal desconocido hace
+          // que Android descarte el aviso sin mostrarlo.
+          ...(notificacion
+            ? { notification: { channel_id: "sismos_sentidos" } }
+            : {}),
         },
         ...(notificacion ? { notification: notificacion } : {}),
       };
