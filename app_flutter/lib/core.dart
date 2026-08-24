@@ -105,6 +105,39 @@ class Quake {
   }
 }
 
+// ---------------- Filtros del usuario ----------------
+// Claves de SharedPreferences. Están aquí porque el isolate que atiende los
+// avisos push arranca sin estado y tiene que leer los mismos ajustes que la
+// pantalla principal escribe: si las claves se separan, el filtro deja de
+// aplicarse justo cuando la app está cerrada.
+const kPrefRadiusKm = 'radius_km';
+const kPrefMinMag = 'min_mag';
+
+/// Valores por defecto, iguales a los de la pantalla principal.
+const kRadiusKmPorDefecto = 500.0;
+const kMinMagPorDefecto = 2.5;
+
+/// Decide si un sismo merece molestar al usuario según lo que configuró.
+///
+/// Se aplica igual en los cuatro caminos de aviso —lista, WebSocket del EMSC,
+/// servicio en segundo plano y push— para que el ajuste signifique lo mismo en
+/// todos. Una emergencia se salta el filtro: un sismo capaz de sentirse con
+/// fuerza se avisa aunque el usuario haya subido la magnitud mínima, porque
+/// ahí ya no es información, es seguridad. [conUbicacion] en falso omite el
+/// criterio de distancia, que sin coordenadas no significa nada.
+bool sismoPasaElFiltro(
+  Quake q, {
+  required double minMag,
+  required double radioKm,
+  bool emergencia = false,
+  bool conUbicacion = true,
+}) {
+  if (emergencia) return true;
+  if (q.mag < minMag) return false;
+  if (conUbicacion && q.dist > radioKm) return false;
+  return true;
+}
+
 class City {
   final String name;
   final double? lat, lon;
