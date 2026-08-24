@@ -13,6 +13,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:vibration/vibration.dart';
 
+import 'core.dart';
 import 'detector.dart';
 import 'quake_notify.dart';
 import 'servidor.dart';
@@ -134,6 +135,7 @@ class SeismoTaskHandler extends TaskHandler {
     await _notifs.initialize(const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
     ));
+    await crearCanalesDeSismo(_notifs);
     _sub = userAccelerometerEventStream(
             samplingPeriod: const Duration(milliseconds: 20))
         .listen(_onMotion, onError: (_) {});
@@ -155,7 +157,7 @@ class SeismoTaskHandler extends TaskHandler {
     if (_lat == 0 && _lon == 0) return; // aún sin ubicación configurada
     final q = quakeFromEmscProps(props, _lat, _lon);
     if (q == null) return;
-    if (q.dist > _radiusKm || q.mag < _minMag) return;
+    if (!sismoPasaElFiltro(q, minMag: _minMag, radioKm: _radiusKm)) return;
     if (_knownIds.contains(q.id)) return;
     _knownIds.add(q.id);
     if (DateTime.now().difference(q.time).inMinutes > 90) return;
@@ -311,7 +313,9 @@ class SeismoTaskHandler extends TaskHandler {
         if (_knownIds.contains(q.id)) continue;
         _knownIds.add(q.id);
         if (_firstPoll) continue; // la primera pasada solo memoriza
-        if (q.dist > radiusKm) continue;
+        // El mismo criterio que aplica la app abierta, para que el ajuste
+        // signifique lo mismo esté la app en pantalla o cerrada.
+        if (!sismoPasaElFiltro(q, minMag: minMag, radioKm: radiusKm)) continue;
         if (DateTime.now().difference(q.time).inMinutes > 90) continue;
         if (appVisible) continue;
         await showQuakeNotification(_notifs, q);
