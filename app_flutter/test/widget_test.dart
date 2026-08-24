@@ -49,7 +49,9 @@ void main() {
     Servidor.baseUrl = '';
     expect(Servidor.activo, isFalse);
     // Sin servidor no se llama a la red: devuelve null y se usan los catálogos.
-    expect(await Servidor.traerSismos(lat: 4.1, lon: -73.6, radiusKm: 300),
+    expect(
+        await Servidor.traerSismos(
+            lat: 4.1, lon: -73.6, radiusKm: 300, minMag: 2.5),
         isNull);
     expect(await Servidor.registrar(anonId: 'x', lat: 4.1, lon: -73.6,
         radioKm: 300, minMag: 2.5), isNull);
@@ -246,5 +248,62 @@ void main() {
     expect(magColor(3.0), kMagLow);
     expect(magColor(4.5), kMagMid);
     expect(magColor(6.0), kMagHigh);
+  });
+
+  group('filtro de avisos', () {
+    // Sismo a ~80 km de Villavicencio, con la magnitud que se le pida.
+    Quake sismo(double mag, {double lat = 4.7110, double lon = -74.0721}) =>
+        Quake.at(
+          id: 'x$mag',
+          mag: mag,
+          lat: lat,
+          lon: lon,
+          depth: 10,
+          time: DateTime.now(),
+          place: 'prueba',
+          source: 'USGS',
+          userLat: 4.1420,
+          userLon: -73.6266,
+        );
+
+    test('la magnitud mínima descarta lo que está por debajo', () {
+      expect(
+        sismoPasaElFiltro(sismo(2.9), minMag: 3.5, radioKm: 500),
+        isFalse,
+      );
+      expect(
+        sismoPasaElFiltro(sismo(3.5), minMag: 3.5, radioKm: 500),
+        isTrue,
+      );
+    });
+
+    test('el radio descarta lo lejano aunque supere la magnitud', () {
+      // Cerca de Lima: miles de kilómetros, magnitud de sobra.
+      final lejos = sismo(6.0, lat: -12.05, lon: -77.04);
+      expect(
+        sismoPasaElFiltro(lejos, minMag: 2.5, radioKm: 500),
+        isFalse,
+      );
+    });
+
+    test('sin ubicación conocida el radio no puede descartar nada', () {
+      // El isolate de push arranca en frío: si no recuperó las coordenadas,
+      // toda distancia se mide desde (0,0) y sería basura. Solo filtra por
+      // magnitud, que sí es fiable.
+      final lejos = sismo(6.0, lat: -12.05, lon: -77.04);
+      expect(
+        sismoPasaElFiltro(lejos,
+            minMag: 2.5, radioKm: 500, conUbicacion: false),
+        isTrue,
+      );
+    });
+
+    test('una emergencia se salta el filtro del usuario', () {
+      expect(
+        sismoPasaElFiltro(sismo(4.0),
+            minMag: 4.5, radioKm: 10, emergencia: true),
+        isTrue,
+      );
+    });
   });
 }
