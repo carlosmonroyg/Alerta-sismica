@@ -1,0 +1,76 @@
+# Compila la app para iOS en un Mac de GitHub Actions.
+#
+# Resuelve el problema de no tener Mac: los runners `macos-*` SON Macs reales
+# con Xcode instalado. Lo que este workflow puede y no puede hacer:
+#
+#   SÍ  · comprobar que el código iOS COMPILA de verdad, no solo que analiza.
+#         Es la única verificación real que existe hoy del trabajo de iOS.
+#   SÍ  · correr el análisis estático y las pruebas.
+#   NO  · instalar la app en un iPhone. Eso exige firmar el binario, firmar
+#         exige certificados, y los certificados exigen cuenta de Apple
+#         Developer (99 USD/año). Ver `--no-codesign` más abajo.
+#
+# Coste: los minutos de macOS se consumen 10 veces más rápido que los de
+# Linux. En repositorios PÚBLICOS los minutos son gratuitos; en uno privado
+# conviene vigilar la cuota antes de dejarlo corriendo en cada push.
+
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app_flutter/**'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'app_flutter/**'
+      - '.github/workflows/ios.yml'
+  # Permite lanzarlo a mano desde la pestaña Actions, sin esperar a un push.
+  workflow_dispatch:
+
+jobs:
+  compilar:
+    name: Compilar iOS (sin firma)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: app_flutter
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Se fija la versión para que CI compile con lo mismo que la máquina de
+      # desarrollo. Si algún día estorba, basta con dejar solo `channel`.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.44.6
+          channel: stable
+          cache: true
+
+      - name: Dependencias
+        run: flutter pub get
+
+      - name: Análisis estático
+        run: flutter analyze
+
+      - name: Pruebas
+        run: flutter test
+
+      # --no-codesign es la pieza clave: compila el binario SIN firmarlo, así
+      # que no hace falta cuenta de Apple ni certificados. Verifica que todo
+      # el código iOS es correcto; el resultado no se puede instalar en un
+      # teléfono, solo demostrar que compila.
+      #
+      # Aquí se genera también el Podfile y se ejecuta `pod install`: por eso
+      # el repositorio no necesita llevar un Podfile, que en Windows no se
+      # puede crear.
+      - name: Compilar iOS
+        run: flutter build ios --release --no-codesign
+
+      - name: Guardar el binario sin firmar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Runner-app-sin-firmar
+          path: app_flutter/build/ios/iphoneos/Runner.app
+          retention-days: 7
