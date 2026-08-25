@@ -222,6 +222,20 @@ class _HomePageState extends State<HomePage> {
           drill: true);
       return;
     }
+    // Consenso comunitario: varios teléfonos sintieron la misma sacudida a la
+    // vez. No viene de un catálogo sino de acelerómetros, así que NO trae
+    // magnitud, y al pasar por el filtro se descartaba en silencio: con la app
+    // abierta este aviso no llegaba nunca. Va antes del filtro porque no hay
+    // magnitud que comparar contra el umbral.
+    if (datos['tipo'] == 'consenso') {
+      final n = int.tryParse('${datos['dispositivos']}') ?? 0;
+      _fireAlert(
+        '⚠️ Movimiento detectado cerca de ti',
+        '${n > 1 ? '$n teléfonos registraron' : 'Varios teléfonos registraron'}'
+            ' una sacudida simultánea. Si lo sentiste, protégete.',
+      );
+      return;
+    }
     final q = Push.sismoDesdeMensaje(datos, lat, lon);
     if (q == null) return;
     if (!_pasaElFiltro(q, emergencia: '${datos['emergencia']}' == '1')) return;
