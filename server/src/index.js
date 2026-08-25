@@ -280,6 +280,10 @@ async function despacharPendientes(env) {
       });
     }
 
+    // Umbral de prioridad de esta zona: de el depende si el aviso despierta
+    // los telefonos o espera a que lo hagan solos.
+    const umbral = await umbralDeLaZona(env, s.lat, s.lon, radio);
+
     // SOLO DATOS, NUNCA CARGA DE "NOTIFICACIÓN".
     //
     // Si el mensaje trae carga de notificación, la dibuja Android antes de que
@@ -296,22 +300,23 @@ async function despacharPendientes(env) {
     const envio = await enviarAZonas(env, zonas, {
       datos,
       notificacion: null,
-      // Prioridad alta SOLO si el sismo puede importarle a alguien.
+      // Prioridad alta si el sismo supera el umbral MÁS BAJO que haya pedido
+      // algún teléfono de la zona.
       //
       // La prioridad alta atraviesa el reposo profundo (Doze) y despierta el
-      // teléfono: es lo correcto para un sismo que puede sentirse, y por eso
-      // antes se ponía siempre. Pero medido sobre el catálogo real, a un
-      // teléfono en Restrepo le llegan 35,5 sismos al día dentro del radio y
-      // solo 0,52 superan un umbral de M3.5. Con prioridad alta fija, el 98 %
-      // de los despertares eran para un aviso que el propio teléfono iba a
-      // descartar —justo lo contrario del motivo por el que existe este
-      // servidor, que es gastar menos batería—. Google además degrada a las
-      // apps que abusan de la prioridad alta sin mostrar nada al usuario.
+      // teléfono. Con prioridad normal Android retiene el mensaje y lo suelta
+      // al desbloquear: los avisos llegaban todos juntos, en cola, horas
+      // después. Para un sismo eso no sirve.
       //
-      // Por debajo del umbral el mensaje viaja en prioridad normal: llega
-      // igual, pero agrupado cuando el teléfono ya está despierto. Un M1.4 a
-      // 200 km es información, no seguridad, y puede esperar.
-      urgente: s.mag >= Number(env.MAG_PRIORIDAD_ALTA ?? 3.5),
+      // Pero ponerla siempre tampoco: medido sobre el catálogo real llegan
+      // 35,5 sismos al día dentro del radio y casi todos los descarta el
+      // propio teléfono, así que eran despertares para nada —lo contrario del
+      // motivo por el que existe este servidor— y Google degrada a las apps
+      // que abusan de la prioridad alta sin mostrar nada.
+      //
+      // El equilibrio correcto no es un número fijo: es el umbral real de los
+      // usuarios. Si alguien pidió avisos desde M3, un M3 lo despierta.
+      urgente: s.mag >= umbral,
     });
 
     // La limpieza de tokens muertos va al final: no debe retrasar el aviso.
@@ -320,9 +325,43 @@ async function despacharPendientes(env) {
     await bitacora(env, s.id, "catalogo", zonas.length, envio, directo);
     salida.push({
       id: s.id, mag: s.mag, lugar: s.lugar, zonas: zonas.length, envio, directo,
+      // Visible a proposito: de este umbral depende que el aviso despierte o
+      // no el telefono, y sin verlo no hay forma de diagnosticar un retraso.
+      umbral, urgente: s.mag >= umbral,
     });
   }
   return salida;
+}
+
+/**
+ * El umbral de magnitud MAS BAJO que haya pedido algun telefono cuyo radio
+ * cubra este sismo. De el depende si el aviso viaja con prioridad alta.
+ *
+ * Nunca devuelve algo por encima del valor por omision de la app: puede
+ * haber telefonos suscritos al tema de su zona que no llegaron a registrarse
+ * aqui —la app se suscribe sola aunque el servidor no responda— y a esos hay
+ * que tratarlos como si tuvieran los ajustes de fabrica. Vale mas gastar
+ * algun despertar de sobra que dejar a alguien sin su aviso.
+ */
+async function umbralDeLaZona(env, lat, lon, radioKm) {
+  const porOmision = Number(env.MAG_PRIORIDAD_ALTA ?? 2.5);
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT celda, radio_km, min_mag FROM dispositivos" +
+      " WHERE token IS NOT NULL"
+    ).all();
+    let minimo = null;
+    for (const d of results ?? []) {
+      const c = centroDeCelda(d.celda);
+      if (haversineKm(lat, lon, c.lat, c.lon) > (d.radio_km ?? radioKm)) continue;
+      const m = Number(d.min_mag ?? 0);
+      if (minimo === null || m < minimo) minimo = m;
+    }
+    return minimo === null ? porOmision : Math.min(porOmision, minimo);
+  } catch (_) {
+    // Ante un fallo de la base, el criterio prudente es el de fabrica.
+    return porOmision;
+  }
 }
 
 /**
