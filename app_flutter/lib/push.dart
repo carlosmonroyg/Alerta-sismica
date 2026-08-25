@@ -42,6 +42,13 @@ Future<void> manejarMensajeEnSegundoPlano(RemoteMessage mensaje) async {
     final notifs = FlutterLocalNotificationsPlugin();
     await notifs.initialize(const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      // El permiso ya lo pidió la app al arrancar; aquí solo hay que poder
+      // dibujar el aviso, no volver a preguntar desde un isolate de fondo.
+      iOS: DarwinInitializationSettings(
+        requestAlertPermission: false,
+        requestBadgePermission: false,
+        requestSoundPermission: false,
+      ),
     ));
     await crearCanalesDeSismo(notifs);
 

@@ -552,6 +552,14 @@ class _HomePageState extends State<HomePage> {
   Future<void> _initNotifications() async {
     const init = InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      // En iOS el permiso se pide aquí, no al mostrar el primer aviso. Se
+      // desactiva la petición automática para hacerla abajo y quedarnos con
+      // la respuesta: si el usuario dice que no, la app tiene que saberlo.
+      iOS: DarwinInitializationSettings(
+        requestAlertPermission: false,
+        requestBadgePermission: false,
+        requestSoundPermission: false,
+      ),
     );
     await _notifs.initialize(
       init,
@@ -561,7 +569,16 @@ class _HomePageState extends State<HomePage> {
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    final granted = await android?.requestNotificationsPermission();
+    final ios = _notifs
+        .resolvePlatformSpecificImplementation<
+          IOSFlutterLocalNotificationsPlugin
+        >();
+    // Cada plataforma resuelve SOLO su implementación; la otra es null. Pedir
+    // el permiso únicamente por la vía de Android dejaba `_notifsReady` en
+    // false para siempre en iOS: la app no habría mostrado un solo aviso.
+    final granted = android != null
+        ? await android.requestNotificationsPermission()
+        : await ios?.requestPermissions(alert: true, badge: false, sound: true);
     _notifsReady = granted ?? false;
     // Declarar los canales antes de necesitarlos: Android descarta en silencio
     // cualquier aviso dirigido a un canal que todavía no existe, y el primer

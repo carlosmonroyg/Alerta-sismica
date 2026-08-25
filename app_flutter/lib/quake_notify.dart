@@ -53,6 +53,10 @@ const kEmergenciaChannelDesc =
 /// todavía no existe lo descarta Android sin mostrarlo, y el primer sismo que
 /// recibe un teléfono recién instalado suele llegar por push, antes de que la
 /// app haya mostrado nada por su cuenta.
+///
+/// En iOS no hace nada, y no hay que protegerla con una comprobación de
+/// plataforma: los canales son un concepto exclusivo de Android, así que
+/// `resolvePlatformSpecificImplementation` devuelve null y la función sale.
 Future<void> crearCanalesDeSismo(FlutterLocalNotificationsPlugin plugin) async {
   final android = plugin.resolvePlatformSpecificImplementation<
       AndroidFlutterLocalNotificationsPlugin>();
@@ -202,6 +206,28 @@ Future<void> showQuakeNotification(
                   contentTitle: title,
                 ),
               ),
+    // iOS NO TIENE CANALES: la urgencia se declara aviso por aviso, con el
+    // nivel de interrupción. El equivalente real a nuestra alarma de Android
+    // —sonar aunque el teléfono esté en silencio— es `critical`, y Apple lo
+    // concede caso por caso previa solicitud. Mientras no se tenga ese
+    // permiso, `timeSensitive` es lo más cerca que se puede llegar: atraviesa
+    // los modos de concentración y enciende la pantalla.
+    iOS: DarwinNotificationDetails(
+      presentAlert: true,
+      presentBanner: true,
+      presentSound: fuerte || sentido,
+      interruptionLevel: fuerte
+          ? InterruptionLevel.timeSensitive
+          : sentido
+              ? InterruptionLevel.active
+              : InterruptionLevel.passive,
+      // Agrupa los avisos por urgencia, como hacen los canales en Android.
+      threadIdentifier: fuerte
+          ? kEmergenciaChannelId
+          : sentido
+              ? kQuakeChannelId
+              : kQuakeInfoChannelId,
+    ),
   );
 
   await plugin.show(
