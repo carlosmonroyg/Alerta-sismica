@@ -296,12 +296,22 @@ async function despacharPendientes(env) {
     const envio = await enviarAZonas(env, zonas, {
       datos,
       notificacion: null,
-      // SIEMPRE prioridad alta. Con prioridad "normal" Android retiene el
-      // mensaje mientras el teléfono está en reposo (Doze) y lo entrega al
-      // salir de él: el usuario veía el sismo recién al desbloquear, a veces
-      // horas después. Un aviso sísmico es exactamente el caso de uso que FCM
-      // contempla para la prioridad alta.
-      urgente: true,
+      // Prioridad alta SOLO si el sismo puede importarle a alguien.
+      //
+      // La prioridad alta atraviesa el reposo profundo (Doze) y despierta el
+      // teléfono: es lo correcto para un sismo que puede sentirse, y por eso
+      // antes se ponía siempre. Pero medido sobre el catálogo real, a un
+      // teléfono en Restrepo le llegan 35,5 sismos al día dentro del radio y
+      // solo 0,52 superan un umbral de M3.5. Con prioridad alta fija, el 98 %
+      // de los despertares eran para un aviso que el propio teléfono iba a
+      // descartar —justo lo contrario del motivo por el que existe este
+      // servidor, que es gastar menos batería—. Google además degrada a las
+      // apps que abusan de la prioridad alta sin mostrar nada al usuario.
+      //
+      // Por debajo del umbral el mensaje viaja en prioridad normal: llega
+      // igual, pero agrupado cuando el teléfono ya está despierto. Un M1.4 a
+      // 200 km es información, no seguridad, y puede esperar.
+      urgente: s.mag >= Number(env.MAG_PRIORIDAD_ALTA ?? 3.5),
     });
 
     // La limpieza de tokens muertos va al final: no debe retrasar el aviso.
