@@ -58,7 +58,7 @@ export default {
           return await listarSismos(url, env);
 
         case "GET /v1/panel":
-          return await datosPanel(url, env);
+          return await datosPanel(url, env, peticion);
 
         case "POST /v1/simulacro":
           return await lanzarSimulacro(peticion, env);
@@ -381,32 +381,38 @@ async function listarSismos(url, env) {
 }
 
 /* ---------------- Panel de la alcaldía ---------------- */
-async function datosPanel(url, env) {
+async function datosPanel(url, env, peticion) {
   const lat = num(url.searchParams.get("lat"), 4.142);
   const lon = num(url.searchParams.get("lon"), -73.627);
   const radio = num(url.searchParams.get("radio"), 350);
-  const desde = Date.now() - 30 * 86400000;
+  const ahora = Date.now();
+  const desde = ahora - 30 * 86400000;
+  const desdeAnterior = ahora - 60 * 86400000;
+
+  // Caja geográfica para que el filtro pese en SQL y no en memoria. Antes se
+  // traían 2000 filas y se descartaban aquí: con el catálogo lleno eso
+  // truncaba el extremo viejo de la ventana y los totales salían cortos.
+  const gLat = radio / 111;
+  const gLon = radio / (111 * Math.max(0.1, Math.cos((lat * Math.PI) / 180)));
+  const caja = [lat - gLat, lat + gLat, lon - gLon, lon + gLon];
 
   const { results } = await env.DB.prepare(
     "SELECT id, fuente, mag, lat, lon, prof, lugar, ocurrio FROM sismos" +
     " WHERE ocurrio > ?1 AND fuente <> 'COMUNIDAD'" +
-    " ORDER BY ocurrio DESC LIMIT 2000"
-  ).bind(desde).all();
+    " AND lat BETWEEN ?2 AND ?3 AND lon BETWEEN ?4 AND ?5" +
+    " ORDER BY ocurrio DESC"
+  ).bind(desde, ...caja).all();
 
   const cerca = (results ?? [])
     .map((s) => ({ ...s, dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)) }))
     .filter((s) => s.dist <= radio);
 
-  const disp = await env.DB.prepare("SELECT COUNT(*) AS n FROM dispositivos").first();
-  const det = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM detecciones WHERE ocurrio > ?1"
-  ).bind(desde).first();
-  const ale = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM alertas WHERE enviada > ?1"
-  ).bind(desde).first();
-  const com = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM sismos WHERE fuente = 'COMUNIDAD' AND ocurrio > ?1"
-  ).bind(desde).first();
+  // Mismo recuento para los 30 días anteriores: da la variación del periodo.
+  const prev = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM sismos" +
+    " WHERE ocurrio > ?1 AND ocurrio <= ?2 AND fuente <> 'COMUNIDAD'" +
+    " AND lat BETWEEN ?3 AND ?4 AND lon BETWEEN ?5 AND ?6"
+  ).bind(desdeAnterior, desde, ...caja).first();
 
   const porDia = {};
   for (const s of cerca) {
@@ -415,22 +421,90 @@ async function datosPanel(url, env) {
     porDia[k] = (porDia[k] ?? 0) + 1;
   }
 
-  return ok({
-    generado: Date.now(),
-    municipio: { lat, lon, radio },
-    sismos: {
-      total: cerca.length,
-      masCercano: cerca.reduce((a, s) => (!a || s.dist < a.dist ? s : a), null),
-      mayor: cerca.reduce((a, s) => (!a || s.mag > a.mag ? s : a), null),
-      sentidos: cerca.filter((s) => intensidad(s.mag, s.dist) >= 3).length,
-      porDia,
-    },
-    plataforma: {
-      dispositivos: disp?.n ?? 0,
+  const total = cerca.length;
+  const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
+  const reparto = (pares) =>
+    pares.map(([clave, n]) => ({ clave, n, pct: pct(n) }));
+
+  const cuenta = (fn) => cerca.filter(fn).length;
+  const sentidos = cuenta((s) => intensidad(s.mag, s.dist) >= 3);
+  const anterior = prev?.n ?? 0;
+
+  const fuentes = {};
+  for (const s of cerca) fuentes[s.fuente] = (fuentes[s.fuente] ?? 0) + 1;
+
+  const proporciones = {
+    porFuente: reparto(
+      Object.entries(fuentes).sort((a, b) => b[1] - a[1])
+    ),
+    porMagnitud: reparto([
+      ["M < 2,0", cuenta((s) => s.mag < 2)],
+      ["M 2,0–2,9", cuenta((s) => s.mag >= 2 && s.mag < 3)],
+      ["M 3,0–3,9", cuenta((s) => s.mag >= 3 && s.mag < 4)],
+      ["M 4,0–4,9", cuenta((s) => s.mag >= 4 && s.mag < 5)],
+      ["M ≥ 5,0", cuenta((s) => s.mag >= 5)],
+    ]),
+    porDistancia: reparto([
+      ["0–50 km", cuenta((s) => s.dist <= 50)],
+      ["50–100 km", cuenta((s) => s.dist > 50 && s.dist <= 100)],
+      ["100–200 km", cuenta((s) => s.dist > 100 && s.dist <= 200)],
+      ["más de 200 km", cuenta((s) => s.dist > 200)],
+    ]),
+    sentidos: { n: sentidos, pct: pct(sentidos) },
+    // Variación contra los 30 días anteriores. Sin periodo previo con datos
+    // no se inventa un porcentaje: se devuelve null y el panel lo omite.
+    variacion: anterior > 0
+      ? { anterior, pct: Math.round(((total - anterior) / anterior) * 1000) / 10 }
+      : { anterior, pct: null },
+  };
+
+  // El bloque de plataforma NO es público: revela el tamaño real del
+  // despliegue. Se entrega solo con la clave del panel.
+  const clave = url.searchParams.get("clave") ?? "";
+  const cabecera = peticion?.headers.get("Authorization") ?? "";
+  const admin = Boolean(env.PANEL_TOKEN) &&
+    (clave === env.PANEL_TOKEN || cabecera === "Bearer " + env.PANEL_TOKEN);
+
+  let plataforma = null;
+  if (admin) {
+    const disp = await env.DB.prepare("SELECT COUNT(*) AS n FROM dispositivos").first();
+    const activos = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM dispositivos WHERE actualizado > ?1"
+    ).bind(ahora - 7 * 86400000).first();
+    const det = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM detecciones WHERE ocurrio > ?1"
+    ).bind(desde).first();
+    const ale = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM alertas WHERE enviada > ?1"
+    ).bind(desde).first();
+    const com = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM sismos WHERE fuente = 'COMUNIDAD' AND ocurrio > ?1"
+    ).bind(desde).first();
+    const nDisp = disp?.n ?? 0;
+    const nAct = activos?.n ?? 0;
+    plataforma = {
+      dispositivos: nDisp,
+      activos7d: nAct,
+      activosPct: nDisp ? Math.round((nAct / nDisp) * 1000) / 10 : 0,
       detecciones: det?.n ?? 0,
       alertas: ale?.n ?? 0,
       eventosComunitarios: com?.n ?? 0,
+    };
+  }
+
+  return ok({
+    generado: ahora,
+    municipio: { lat, lon, radio },
+    admin,
+    sismos: {
+      total,
+      masCercano: cerca.reduce((a, s) => (!a || s.dist < a.dist ? s : a), null),
+      mayor: cerca.reduce((a, s) => (!a || s.mag > a.mag ? s : a), null),
+      sentidos,
+      porDia,
     },
+    proporciones,
+    plataforma,
     lista: cerca.slice(0, 500),
   });
 }

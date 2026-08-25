@@ -57,7 +57,7 @@ if [ ! -f .dev.vars ]; then
   echo "      ERROR: falta .dev.vars con las credenciales de Firebase."
   exit 1
 fi
-for CLAVE in ADMIN_TOKEN FCM_PROJECT_ID FCM_CLIENT_EMAIL FCM_PRIVATE_KEY; do
+for CLAVE in ADMIN_TOKEN PANEL_TOKEN FCM_PROJECT_ID FCM_CLIENT_EMAIL FCM_PRIVATE_KEY; do
   VALOR=$(grep "^$CLAVE=" .dev.vars | head -1 | cut -d= -f2-)
   if [ -z "$VALOR" ]; then
     echo "      aviso: $CLAVE está vacío, se omite"

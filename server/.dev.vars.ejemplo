@@ -5,3 +5,7 @@ ADMIN_TOKEN=pon-aqui-una-clave-larga
 FCM_PROJECT_ID=
 FCM_CLIENT_EMAIL=
 FCM_PRIVATE_KEY=
+# Clave del panel: destapa el bloque "Plataforma" (teléfonos, alertas). Es
+# aparte de ADMIN_TOKEN a propósito: si se filtra, solo deja ver estadísticas,
+# nunca lanzar un simulacro.
+PANEL_TOKEN=pon-aqui-otra-clave-larga

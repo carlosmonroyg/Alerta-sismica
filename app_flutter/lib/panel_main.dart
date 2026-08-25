@@ -91,25 +91,79 @@ class PanelApp extends StatelessWidget {
 }
 
 /// Datos que entrega el servidor en /v1/panel.
+/// Un tramo del reparto porcentual (por fuente, magnitud o distancia).
+class Reparto {
+  final String clave;
+  final int n;
+  final double pct;
+  const Reparto(this.clave, this.n, this.pct);
+
+  static List<Reparto> lista(dynamic v) => ((v as List?) ?? [])
+      .cast<Map<String, dynamic>>()
+      .map((e) => Reparto(
+            (e['clave'] as String?) ?? '',
+            (e['n'] as num?)?.toInt() ?? 0,
+            (e['pct'] as num?)?.toDouble() ?? 0,
+          ))
+      .toList();
+}
+
+/// Cifras de la plataforma. Solo llegan con la clave del panel: revelan el
+/// tamaño real del despliegue, que no es información pública.
+class Plataforma {
+  final int dispositivos, activos7d, detecciones, alertas, comunitarios;
+  final double activosPct;
+  const Plataforma({
+    required this.dispositivos,
+    required this.activos7d,
+    required this.activosPct,
+    required this.detecciones,
+    required this.alertas,
+    required this.comunitarios,
+  });
+
+  static Plataforma? desdeJson(dynamic v) {
+    if (v is! Map) return null;
+    return Plataforma(
+      dispositivos: (v['dispositivos'] as num?)?.toInt() ?? 0,
+      activos7d: (v['activos7d'] as num?)?.toInt() ?? 0,
+      activosPct: (v['activosPct'] as num?)?.toDouble() ?? 0,
+      detecciones: (v['detecciones'] as num?)?.toInt() ?? 0,
+      alertas: (v['alertas'] as num?)?.toInt() ?? 0,
+      comunitarios: (v['eventosComunitarios'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
 class DatosPanel {
-  final int total, sentidos, dispositivos, detecciones, alertas, comunitarios;
+  final int total, sentidos;
+  final double sentidosPct;
   final Quake? masCercano, mayor;
   final Map<String, int> porDia;
   final List<Quake> lista;
   final DateTime generado;
+  final List<Reparto> porFuente, porMagnitud, porDistancia;
+  /// null cuando no hay mes anterior con datos: no se inventa una cifra.
+  final double? variacionPct;
+  final int variacionAnterior;
+  /// Solo con la clave del panel.
+  final Plataforma? plataforma;
 
   const DatosPanel({
     required this.total,
     required this.sentidos,
-    required this.dispositivos,
-    required this.detecciones,
-    required this.alertas,
-    required this.comunitarios,
+    required this.sentidosPct,
     required this.masCercano,
     required this.mayor,
     required this.porDia,
     required this.lista,
     required this.generado,
+    required this.porFuente,
+    required this.porMagnitud,
+    required this.porDistancia,
+    required this.variacionPct,
+    required this.variacionAnterior,
+    required this.plataforma,
   });
 
   static Quake? _quake(Map<String, dynamic>? s, double lat, double lon) {
@@ -130,14 +184,13 @@ class DatosPanel {
 
   factory DatosPanel.desdeJson(Map<String, dynamic> j, double lat, double lon) {
     final s = j['sismos'] as Map<String, dynamic>;
-    final p = j['plataforma'] as Map<String, dynamic>;
+    final pr = (j['proporciones'] as Map<String, dynamic>?) ?? const {};
+    final va = (pr['variacion'] as Map<String, dynamic>?) ?? const {};
+    final se = (pr['sentidos'] as Map<String, dynamic>?) ?? const {};
     return DatosPanel(
       total: (s['total'] as num?)?.toInt() ?? 0,
       sentidos: (s['sentidos'] as num?)?.toInt() ?? 0,
-      dispositivos: (p['dispositivos'] as num?)?.toInt() ?? 0,
-      detecciones: (p['detecciones'] as num?)?.toInt() ?? 0,
-      alertas: (p['alertas'] as num?)?.toInt() ?? 0,
-      comunitarios: (p['eventosComunitarios'] as num?)?.toInt() ?? 0,
+      sentidosPct: (se['pct'] as num?)?.toDouble() ?? 0,
       masCercano: _quake(s['masCercano'] as Map<String, dynamic>?, lat, lon),
       mayor: _quake(s['mayor'] as Map<String, dynamic>?, lat, lon),
       porDia: ((s['porDia'] as Map?) ?? {})
@@ -148,6 +201,12 @@ class DatosPanel {
           .toList(),
       generado: DateTime.fromMillisecondsSinceEpoch(
           (j['generado'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch),
+      porFuente: Reparto.lista(pr['porFuente']),
+      porMagnitud: Reparto.lista(pr['porMagnitud']),
+      porDistancia: Reparto.lista(pr['porDistancia']),
+      variacionPct: (va['pct'] as num?)?.toDouble(),
+      variacionAnterior: (va['anterior'] as num?)?.toInt() ?? 0,
+      plataforma: Plataforma.desdeJson(j['plataforma']),
     );
   }
 }
@@ -211,8 +270,12 @@ class _PanelPageState extends State<PanelPage> {
   Future<void> _cargar() async {
     final m = widget.municipio;
     try {
-      final r = await http.get(_apiUri(
-          'v1/panel?lat=${m.lat}&lon=${m.lon}&radio=${radio.round()}'));
+      // La clave viaja tal cual desde la URL del navegador: destapa el bloque
+      // de plataforma. Sin ella el panel funciona igual, solo con lo público.
+      final clave = Uri.base.queryParameters['clave'] ?? '';
+      final r = await http.get(_apiUri('v1/panel?lat=${m.lat}&lon=${m.lon}'
+          '&radio=${radio.round()}'
+          '${clave.isEmpty ? '' : '&clave=${Uri.encodeQueryComponent(clave)}'}'));
       if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}');
       final j = jsonDecode(r.body) as Map<String, dynamic>;
       if (!mounted) return;
@@ -325,8 +388,13 @@ class _PanelPageState extends State<PanelPage> {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _tituloSeccion('Situación del municipio', filtro: true),
       _rejilla([
-        _kpi('Sismos en 30 días', '${d.total}',
-            'Dentro de ${radio.round()} km del casco urbano'),
+        _kpi(
+            'Sismos en 30 días',
+            '${d.total}',
+            d.variacionPct == null
+                ? 'Dentro de ${radio.round()} km del casco urbano'
+                : '${d.variacionPct! >= 0 ? '+' : ''}${_pct(d.variacionPct!)}'
+                    ' frente a los 30 días anteriores (${d.variacionAnterior})'),
         _kpi(
             'Epicentro más cercano',
             d.masCercano == null ? '—' : '${d.masCercano!.dist.round()}',
@@ -343,60 +411,58 @@ class _PanelPageState extends State<PanelPage> {
         _kpi('Potencialmente sentidos', '${d.sentidos}',
             'Intensidad estimada ≥ III en el casco urbano'),
       ]),
-      _tituloSeccion('Plataforma ciudadana'),
-      _rejilla([
-        _kpi('Teléfonos vinculados', '${d.dispositivos}',
-            'Ciudadanos que reciben alertas'),
-        _kpi('Detecciones ciudadanas', '${d.detecciones}',
-            'Disparos del sismógrafo de los teléfonos'),
-        _kpi('Eventos por consenso', '${d.comunitarios}',
-            'Confirmados por varios teléfonos a la vez'),
-        _kpi('Alertas despachadas', '${d.alertas}',
-            'Avisos enviados en el periodo'),
-      ]),
-      _tituloSeccion('Actividad'),
+      _tituloSeccion('Composición de los sismos registrados'),
       LayoutBuilder(builder: (context, c) {
         final angosto = c.maxWidth < 900;
-        final graficas = [
-          Expanded(
-            flex: angosto ? 0 : 155,
-            child: _tarjeta(
-              'Sismos por día',
-              'Últimos 30 días',
-              SizedBox(
-                  height: 200,
-                  child: CustomPaint(
-                      painter: BarrasDiarias(d.porDia), size: Size.infinite)),
-            ),
-          ),
-          Expanded(
-            flex: angosto ? 0 : 100,
-            child: _tarjeta(
-              'Distribución por magnitud',
-              'Escala local del SGC',
-              SizedBox(
-                  height: 200,
-                  child: CustomPaint(
-                      painter: BarrasMagnitud(d.lista), size: Size.infinite)),
-            ),
-          ),
+        final bloques = [
+          _repartoTarjeta('Por catálogo', 'Quién reportó cada evento', d.porFuente),
+          _repartoTarjeta('Por magnitud', 'Escala local del SGC', d.porMagnitud),
+          _repartoTarjeta(
+              'Por distancia', 'Desde el casco urbano', d.porDistancia),
         ];
         if (angosto) {
           return Column(
-              children: graficas
-                  .map((e) => Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: (e).child))
+              children: bloques
+                  .map((b) => Padding(
+                      padding: const EdgeInsets.only(bottom: 14), child: b))
                   .toList());
         }
-        return IntrinsicHeight(
-          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            graficas[0],
-            const SizedBox(width: 12),
-            graficas[1],
-          ]),
-        );
+        return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (var i = 0; i < bloques.length; i++) ...[
+                Expanded(child: bloques[i]),
+                if (i < bloques.length - 1) const SizedBox(width: 14),
+              ]
+            ]);
       }),
+      if (d.plataforma != null) ...[
+        _tituloSeccion('Plataforma ciudadana'),
+        _rejilla([
+          _kpi('Teléfonos vinculados', '${d.plataforma!.dispositivos}',
+              '${d.plataforma!.activos7d} activos en 7 días'
+              ' (${_pct(d.plataforma!.activosPct)})'),
+          _kpi('Detecciones ciudadanas', '${d.plataforma!.detecciones}',
+              'Disparos del sismógrafo de los teléfonos'),
+          _kpi('Eventos por consenso', '${d.plataforma!.comunitarios}',
+              'Confirmados por varios teléfonos a la vez'),
+          _kpi('Alertas despachadas', '${d.plataforma!.alertas}',
+              'Avisos enviados en el periodo'),
+        ]),
+      ],
+      _tituloSeccion('Actividad'),
+      // Antes había aquí un segundo gráfico de magnitudes. Se quitó porque se
+      // alimentaba de la lista recortada a 500 eventos y contradecía a la
+      // tarjeta 'Por magnitud', que sí cuenta el periodo completo: dos cifras
+      // distintas para el mismo dato en la misma pantalla.
+      _tarjeta(
+        'Sismos por día',
+        'Últimos 30 días · ${d.total} eventos en ${radio.round()} km',
+        SizedBox(
+            height: 220,
+            child: CustomPaint(
+                painter: BarrasDiarias(d.porDia), size: Size.infinite)),
+      ),
       _tituloSeccion('Epicentros y fallas activas'),
       _tarjeta(
         null,
@@ -546,6 +612,77 @@ class _PanelPageState extends State<PanelPage> {
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontSize: 12, color: _mutedP)),
       ]),
+    );
+  }
+
+  /// Porcentaje con una decimal y coma decimal, como se escribe en español.
+  static String _pct(double v) =>
+      '${v.toStringAsFixed(1).replaceAll('.', ',')} %';
+
+  /// Reparto porcentual en barras horizontales. Se prefiere a un anillo
+  /// porque aquí las etiquetas son largas y las proporciones muy desiguales:
+  /// en un anillo, un tramo de 0,4 % es invisible; en barra sigue leyéndose.
+  Widget _repartoTarjeta(String titulo, String sub, List<Reparto> datos) {
+    final maximo = datos.fold<double>(0, (m, r) => r.pct > m ? r.pct : m);
+    return _tarjeta(
+      titulo,
+      sub,
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: datos.isEmpty
+            ? [
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 18),
+                  child: Text('Sin registros en el periodo',
+                      style: TextStyle(fontSize: 13, color: _mutedP)),
+                )
+              ]
+            : [
+                for (final r in datos)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(r.clave,
+                                  style: const TextStyle(fontSize: 12.5)),
+                            ),
+                            Text('${r.n}',
+                                style: const TextStyle(
+                                    fontSize: 12.5, color: _mutedP)),
+                            const SizedBox(width: 10),
+                            SizedBox(
+                              width: 54,
+                              child: Text(_pct(r.pct),
+                                  textAlign: TextAlign.right,
+                                  style: const TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w700)),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 5),
+                        // La barra se escala al tramo mayor, no al 100 %: con
+                        // un catálogo que aporta el 99 % los demás quedarían
+                        // como una línea invisible.
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(3),
+                          child: LinearProgressIndicator(
+                            value: maximo <= 0 ? 0 : r.pct / maximo,
+                            minHeight: 6,
+                            backgroundColor: _lineSoft,
+                            valueColor:
+                                const AlwaysStoppedAnimation(_accentP),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+      ),
     );
   }
 
@@ -794,76 +931,6 @@ class BarrasDiarias extends CustomPainter {
   bool shouldRepaint(covariant BarrasDiarias old) => old.porDia != porDia;
 }
 
-// ---------------- Gráfica: distribución por magnitud ----------------
-class BarrasMagnitud extends CustomPainter {
-  final List<Quake> lista;
-  BarrasMagnitud(this.lista);
-
-  static const _bins = [
-    ('< 2,0', 0),
-    ('2,0–2,9', 0),
-    ('3,0–3,9', 1),
-    ('4,0–4,9', 2),
-    ('≥ 5,0', 3),
-  ];
-
-  int _bin(double m) =>
-      m < 2 ? 0 : (m < 3 ? 1 : (m < 4 ? 2 : (m < 5 ? 3 : 4)));
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    const mL = 34.0, mR = 8.0, mT = 10.0, mB = 34.0;
-    final valores = List<int>.filled(5, 0);
-    for (final q in lista) {
-      valores[_bin(q.mag)]++;
-    }
-    final max = math.max(4, valores.fold<int>(0, math.max));
-    final paso = max <= 8 ? 2 : (max <= 20 ? 5 : (max <= 60 ? 15 : 25));
-    final plotW = size.width - mL - mR, plotH = size.height - mT - mB;
-    final bw = plotW / 5;
-    double y(num v) => mT + plotH - (v / max) * plotH;
-
-    final grid = Paint()
-      ..color = _lineSoft
-      ..strokeWidth = 1;
-    for (var g = 0; g <= max; g += paso) {
-      canvas.drawLine(Offset(mL, y(g)), Offset(size.width - mR, y(g)), grid);
-      _texto(canvas, '$g', Offset(mL - 7, y(g) - 6), _mutedP, 10.5,
-          alineado: TextAlign.right, ancho: 30);
-    }
-    canvas.drawLine(
-        Offset(mL, mT + plotH), Offset(size.width - mR, mT + plotH), grid);
-
-    for (var i = 0; i < 5; i++) {
-      final v = valores[i];
-      final x = mL + i * bw + bw * .18;
-      final w = bw * .64;
-      if (v > 0) {
-        final h = math.max(2.0, (v / max) * plotH);
-        canvas.drawRRect(
-          RRect.fromRectAndCorners(
-            Rect.fromLTWH(x, mT + plotH - h, w, h),
-            topLeft: const Radius.circular(2.5),
-            topRight: const Radius.circular(2.5),
-          ),
-          Paint()..color = _seis[_bins[i].$2],
-        );
-        _texto(canvas, '$v', Offset(x + w / 2 - 15, mT + plotH - h - 16),
-            _mutedP, 10.5,
-            ancho: 30, alineado: TextAlign.center, negrita: true);
-      }
-      _texto(canvas, _bins[i].$1, Offset(x + w / 2 - 26, size.height - 28),
-          _mutedP, 10.5,
-          ancho: 52, alineado: TextAlign.center);
-    }
-    _texto(canvas, 'Magnitud', Offset(size.width / 2 - 30, size.height - 14),
-        _mutedP, 10.5,
-        ancho: 60, alineado: TextAlign.center);
-  }
-
-  @override
-  bool shouldRepaint(covariant BarrasMagnitud old) => old.lista != lista;
-}
 
 // ---------------- Mapa de epicentros y fallas ----------------
 class MapaSismico extends CustomPainter {

@@ -17,3 +17,7 @@ publico/panel/
 *service-account*.json
 *.pem
 *.key
+
+# SQL de carga inicial: se regenera con tool/rellenar.mjs, no es fuente.
+tool/relleno*.sql
+tool/relleno*.log

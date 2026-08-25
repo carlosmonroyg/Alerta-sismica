@@ -121,3 +121,37 @@ pantalla, suena con volumen de alarma y aparece sobre el bloqueo.
 - Cloudflare Workers no puede mantener una conexión WebSocket permanente
   hacia el EMSC; por eso se consulta cada minuto. Si algún día hiciera falta
   el tiempo real estricto, habría que mover esa pieza a un servidor propio.
+
+## Panel: qué es público y qué no
+
+El panel vive en `/panel/` y **no pide credencial**: los sismos, las gráficas, el
+mapa y las fallas son datos de interés público del SGC/USGS/EMSC.
+
+Lo que sí está protegido es el bloque **Plataforma ciudadana** (teléfonos
+vinculados, detecciones, alertas despachadas). Revela el tamaño real del
+despliegue, que no es información pública. Aparece solo con la clave:
+
+    https://TU-URL.workers.dev/panel/?municipio=Restrepo&lat=4.26&lon=-73.56&clave=LA_CLAVE
+
+La clave es `PANEL_TOKEN`, **aparte de `ADMIN_TOKEN` a propósito**: si se filtra,
+lo peor que ocurre es que alguien vea estadísticas; nunca que lance un simulacro.
+
+Aviso: una clave incrustada en la app no protegería nada —quien tenga el APK
+puede extraerla—. Por eso la app abre el panel público y la vista administrativa
+se abre a mano con la clave.
+
+## Carga inicial de historia
+
+Una base recién creada no tiene pasado, y un panel de gestión con un día de
+datos no sirve para decidir. `tool/rellenar.mjs` trae el histórico de los tres
+catálogos y genera el SQL:
+
+    node tool/rellenar.mjs 60 > tool/relleno.sql
+    npx wrangler d1 execute alerta_sismica --remote --file=tool/relleno.sql
+
+Los eventos entran con `notificado = 1`: son sismos viejos y nadie debe recibir
+una alerta por ellos. El SGC ignora los filtros de fecha, así que el script
+pagina hacia atrás hasta salirse del rango (unas 46 páginas para 60 días).
+
+Con 60 días cargados el panel puede comparar el mes actual contra el anterior;
+con solo 30 esa variación sale vacía a propósito, en vez de inventar una cifra.
