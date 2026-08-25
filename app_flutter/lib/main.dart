@@ -141,8 +141,8 @@ class _HomePageState extends State<HomePage> {
     if (!mounted) return;
     setState(() {
       anonId = id!;
-      radiusKm = _prefs!.getDouble('radius_km') ?? radiusKm;
-      minMag = _prefs!.getDouble('min_mag') ?? minMag;
+      radiusKm = _prefs!.getDouble(kPrefRadiusKm) ?? radiusKm;
+      minMag = _prefs!.getDouble(kPrefMinMag) ?? minMag;
       // Lo que el usuario haya configurado manda; si no, el valor de compilación.
       // Ojo: una preferencia guardada como cadena VACÍA no es lo mismo que
       // "sin preferencia". Si no hay nada útil guardado, manda la URL fijada
@@ -224,7 +224,7 @@ class _HomePageState extends State<HomePage> {
     }
     final q = Push.sismoDesdeMensaje(datos, lat, lon);
     if (q == null) return;
-    if (q.dist > radiusKm || q.mag < minMag) return;
+    if (!_pasaElFiltro(q, emergencia: '${datos['emergencia']}' == '1')) return;
     if (knownIds.contains(q.id)) return;
     knownIds.add(q.id);
     setState(() {
@@ -549,6 +549,10 @@ class _HomePageState extends State<HomePage> {
         >();
     final granted = await android?.requestNotificationsPermission();
     _notifsReady = granted ?? false;
+    // Declarar los canales antes de necesitarlos: Android descarta en silencio
+    // cualquier aviso dirigido a un canal que todavía no existe, y el primer
+    // sismo de una instalación nueva suele llegar por push.
+    await crearCanalesDeSismo(_notifs);
     // Desde Android 14 las alertas que se apoderan de la pantalla requieren
     // un permiso aparte, pensado para apps de alarma y emergencia. Sin él, un
     // sismo fuerte quedaría como una tarjeta más en la cortina.
@@ -634,15 +638,19 @@ class _HomePageState extends State<HomePage> {
     // El servidor ya entrega los sismos fusionados y deduplicados: usarlo
     // le ahorra al usuario descargar los catálogos completos (~13 MB/día).
     if (Servidor.activo) {
+      // La magnitud mínima viaja con la petición: sin ella el servidor
+      // devolvía TODO su catálogo dentro del radio y la lista contradecía el
+      // ajuste del usuario (además de disparar un aviso por cada micro-sismo).
       final delServidor = await Servidor.traerSismos(
         lat: lat,
         lon: lon,
         radiusKm: radiusKm,
+        minMag: minMag,
         dias: 7,
       );
       if (delServidor != null && mounted) {
         setState(() {
-          quakes = delServidor;
+          quakes = _filtrados(delServidor);
           online = true;
           final now = TimeOfDay.now();
           final hh = now.hour.toString().padLeft(2, '0');
@@ -673,12 +681,14 @@ class _HomePageState extends State<HomePage> {
     }
     final limite = DateTime.now().subtract(const Duration(days: 7));
     setState(() {
-      quakes = full
-          ? res.quakes
-          : dedupQuakes([
-              ...res.quakes,
-              ...quakes,
-            ]).where((q) => q.time.isAfter(limite)).toList();
+      quakes = _filtrados(
+        full
+            ? res.quakes
+            : dedupQuakes([
+                ...res.quakes,
+                ...quakes,
+              ]).where((q) => q.time.isAfter(limite)),
+      );
       online = true;
       final now = TimeOfDay.now();
       final hh = now.hour.toString().padLeft(2, '0');
@@ -694,7 +704,7 @@ class _HomePageState extends State<HomePage> {
   /// Evento nuevo empujado por el WebSocket de EMSC (llega en segundos).
   void _onEmscLiveEvent(Map<String, dynamic> props) {
     final q = quakeFromEmscProps(props, lat, lon);
-    if (q == null || q.dist > radiusKm || q.mag < minMag) return;
+    if (q == null || !_pasaElFiltro(q)) return;
     if (!mounted) return;
     // Evitar duplicar un evento que ya está listado por SGC/USGS.
     final dup = quakes.any(
@@ -714,6 +724,26 @@ class _HomePageState extends State<HomePage> {
     _assessRisk();
   }
 
+  /// Los ajustes del usuario aplicados a un sismo concreto. Vive aquí para que
+  /// los tres caminos de aviso —lista, WebSocket y push— decidan igual.
+  bool _pasaElFiltro(Quake q, {bool emergencia = false}) => sismoPasaElFiltro(
+        q,
+        minMag: minMag,
+        radioKm: radiusKm,
+        // Un sismo que puede sentirse con fuerza no lo silencia un ajuste.
+        emergencia: emergencia || q.felt >= 4.5,
+      );
+
+  /// ÚNICA PUERTA DE ENTRADA a la lista que se muestra.
+  ///
+  /// La lista alimenta a la vez el listado, el radar y el mapa, así que basta
+  /// con que un sismo se cuele en ella para que aparezca en los tres sitios
+  /// contradiciendo el ajuste. Antes el filtro se aplicaba en cada camino por
+  /// separado —y cada camino nuevo era una fuga en potencia—; ahora todo lo
+  /// que entra pasa por aquí.
+  List<Quake> _filtrados(Iterable<Quake> lista) =>
+      lista.where(_pasaElFiltro).toList();
+
   void _detectNewQuakes() {
     for (final q in quakes) {
       if (knownIds.contains(q.id)) continue;
@@ -721,9 +751,10 @@ class _HomePageState extends State<HomePage> {
       if (firstLoad) continue;
       final ageMin = DateTime.now().difference(q.time).inMinutes;
       if (ageMin > 90) continue; // solo eventos realmente frescos
-      if (q.dist > radiusKm) continue; // fuera del radio elegido
+      // Radio Y magnitud mínima: el ajuste de magnitud se ignoraba aquí, así
+      // que subirlo a M3.5 no cambiaba nada y seguían avisándose todos.
+      if (!_pasaElFiltro(q)) continue;
 
-      // Aviso en la barra de estado por CUALQUIER sismo nuevo dentro del radio.
       if (_notifsReady) showQuakeNotification(_notifs, q);
 
       if (q.felt >= 4.5 || (q.mag >= 5 && q.dist < 300)) {
@@ -1357,7 +1388,7 @@ class _HomePageState extends State<HomePage> {
                   onChanged: (v) {
                     if (v == null) return;
                     setState(() => radiusKm = v);
-                    _prefs?.setDouble('radius_km', v);
+                    _prefs?.setDouble(kPrefRadiusKm, v);
                     _reload();
                   },
                 ),
@@ -1376,7 +1407,7 @@ class _HomePageState extends State<HomePage> {
                   onChanged: (v) {
                     if (v == null) return;
                     setState(() => minMag = v);
-                    _prefs?.setDouble('min_mag', v);
+                    _prefs?.setDouble(kPrefMinMag, v);
                     _reload();
                   },
                 ),
