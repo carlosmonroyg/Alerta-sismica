@@ -7,6 +7,8 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
+
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -82,8 +84,24 @@ void initSeismoServiceConfig() {
   );
 }
 
+/// Si el teléfono puede vigilar con la app cerrada.
+///
+/// SOLO ANDROID. Todo esto se apoya en un servicio en primer plano, un
+/// concepto que iOS no tiene: allí el sistema suspende la app a los pocos
+/// segundos de salir de ella, y no hay manera de dejar el acelerómetro
+/// leyendo ni de sondear los catálogos. En iOS el único aviso que llega con
+/// la app cerrada es el push, que lo entrega el sistema por APNs sin que la
+/// app necesite estar viva.
+///
+/// Se comprueba con `defaultTargetPlatform` y no con `Platform.isAndroid`
+/// porque `dart:io` no existe en la web, donde también se compila el panel.
+bool get vigilanciaEnSegundoPlanoDisponible =>
+    !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
 /// Arranca la vigilancia. Devuelve true si el servicio quedó corriendo.
 Future<bool> startSeismoWatch() async {
+  // En iOS no hay servicio que arrancar: mejor decirlo que fallar callando.
+  if (!vigilanciaEnSegundoPlanoDisponible) return false;
   try {
     // Pedir al usuario excluir la app de la optimización de batería para
     // que Android no mate el servicio de madrugada.

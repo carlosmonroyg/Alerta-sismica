@@ -2189,9 +2189,16 @@ class _SeismoViewState extends State<SeismoView> {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          widget.bgWatchOn
-                              ? 'El detector sigue activo con la pantalla apagada.'
-                              : 'Sigue detectando aunque cierres la app o se apague la pantalla.',
+                          // En iOS el interruptor no puede cumplir lo que
+                          // promete: el sistema suspende la app al cerrarla.
+                          // Vale más decirlo que ofrecer algo que no ocurre.
+                          !vigilanciaEnSegundoPlanoDisponible
+                              ? 'No disponible en iPhone: el sistema suspende la '
+                                  'app al cerrarla. Los sismos te llegan igual '
+                                  'por notificación.'
+                              : widget.bgWatchOn
+                                  ? 'El detector sigue activo con la pantalla apagada.'
+                                  : 'Sigue detectando aunque cierres la app o se apague la pantalla.',
                           style: const TextStyle(fontSize: 11.5, color: kMuted),
                         ),
                       ],
@@ -2200,7 +2207,10 @@ class _SeismoViewState extends State<SeismoView> {
                   Switch(
                     value: widget.bgWatchOn,
                     activeTrackColor: kSafe,
-                    onChanged: widget.onToggleBgWatch,
+                    // null deja el interruptor visiblemente deshabilitado.
+                    onChanged: vigilanciaEnSegundoPlanoDisponible
+                        ? widget.onToggleBgWatch
+                        : null,
                   ),
                 ],
               ),
