@@ -65,7 +65,10 @@ dev_dependencies:
 
 flutter_launcher_icons:
   android: true
-  ios: false
+  ios: true
+  # La App Store RECHAZA iconos con canal alfa. Sin esto el binario se sube,
+  # falla la validación de App Store Connect y hay que rehacer el envío.
+  remove_alpha_ios: true
   image_path: "assets/icon/icon.png"
   adaptive_icon_background: "assets/icon/icon_bg.png"
   adaptive_icon_foreground: "assets/icon/icon_fg.png"
