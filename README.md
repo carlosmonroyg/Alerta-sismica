@@ -105,38 +105,7 @@ bash desplegar.sh           # crea la base, carga secretos y publica
 Imprime al final la URL pública, que es la que va en `SERVIDOR_URL` de `claves.env`.
 Detalles en [server/README.md](server/README.md).
 
-## Trabajar desde otro computador
 
-Git trae todo el código, pero **las credenciales no viajan a propósito**. Son dos
-archivos que hay que llevar a mano:  y
-. La guía completa —qué contienen, cómo regenerarlos si se
-pierden y cómo transportarlos sin exponerlos— está en
-[CONFIGURAR.md](CONFIGURAR.md).
-
-## Credenciales: qué es secreto y qué no
-
-**Nada de esto vive en el repositorio.** El historial se auditó y nunca ha
-contenido una credencial.
-
-| Archivo | Qué guarda | Riesgo si se filtra |
-|---|---|---|
-| `server/.dev.vars` | Clave privada de la cuenta de servicio de Firebase | **Grave.** Permite enviar notificaciones en nombre de la app: alertas de sismo falsas a todos los usuarios. |
-| `app_flutter/claves.env` | URL del servidor y los 4 valores de Firebase | Bajo. Ver abajo. |
-| `app_flutter/android/app/google-services.json` | Los mismos 4 valores | Bajo. |
-| `*.jks`, `key.properties` | Firma de Android para Play Store | **Grave.** Quien la tenga puede publicar actualizaciones suplantando la app. |
-
-Sobre los cuatro valores de Firebase, dicho con honestidad: **no son un secreto
-criptográfico**. Viajan dentro de cualquier APK y quien descargue la app puede
-extraerlos; Firebase los protege con las reglas del proyecto, no ocultándolos. Se
-mantienen fuera del repositorio por higiene y para no invitar a que otros consuman
-la cuota del proyecto, no porque filtrarlos comprometa las cuentas.
-
-La que sí importa de verdad es la **cuenta de servicio**: con ella se pueden
-disparar alertas falsas. Vive solo en `.dev.vars` (local) y como secreto cifrado
-de Cloudflare (producción).
-
-Si alguna vez se sube un secreto por error, quitarlo en un commit posterior **no
-sirve**: queda en el historial. Hay que rotarlo en la consola que lo emitió.
 
 ## Limitaciones honestas
 
