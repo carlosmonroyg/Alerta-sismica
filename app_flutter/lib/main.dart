@@ -681,7 +681,12 @@ class _HomePageState extends State<HomePage> {
       );
       if (delServidor != null && mounted) {
         setState(() {
-          quakes = _filtrados(delServidor);
+          // dedupQuakes TAMBIÉN aquí: el camino del servidor era el único que
+          // no fusionaba, y como es el que se usa cuando hay servidor, un
+          // mismo sismo llegaba tres veces —una por catálogo— con tres
+          // magnitudes distintas. El servidor ya lo fusiona, pero la app no
+          // debe depender de qué versión tenga desplegada.
+          quakes = _filtrados(dedupQuakes(delServidor));
           online = true;
           final now = TimeOfDay.now();
           final hh = now.hour.toString().padLeft(2, '0');

@@ -72,12 +72,32 @@ Future<FetchResult> fetchAllSources({
   return FetchResult(dedupQuakes(all), ok);
 }
 
+/// Prioridad de catálogos al fusionar: gana el primero de la lista. El SGC es
+/// el organismo oficial de Colombia y publica soluciones revisadas.
+const kPrioridadFuente = ['SGC', 'USGS', 'EMSC'];
+
 /// Fusiona sismos repetidos entre catálogos: mismo evento si ocurre a menos
-/// de 120 s y 60 km de otro ya aceptado. Gana el que aparezca primero en la
-/// lista (por eso las fuentes se agregan en orden de prioridad).
+/// de 120 s y 60 km de otro ya aceptado.
+///
+/// El orden de prioridad se aplica AQUÍ y no se delega en cómo venga la lista.
+/// Antes se confiaba en que el llamador agregara las fuentes en orden, cosa
+/// que solo hacía fetchAllSources: la lista del servidor llega ordenada por
+/// tiempo, así que el ganador dependía de cuál catálogo hubiera publicado
+/// unos segundos más tarde. Debe coincidir con dedupSismos() de
+/// server/src/geo.js; si cambia aquí, hay que cambiarlo allá.
 List<Quake> dedupQuakes(List<Quake> all) {
+  int rango(String fuente) {
+    final i = kPrioridadFuente.indexOf(fuente);
+    return i == -1 ? kPrioridadFuente.length : i;
+  }
+
+  final porPrioridad = [...all]..sort((a, b) {
+      final r = rango(a.source).compareTo(rango(b.source));
+      return r != 0 ? r : b.time.compareTo(a.time);
+    });
+
   final merged = <Quake>[];
-  for (final q in all) {
+  for (final q in porPrioridad) {
     final isDup = merged.any((m) =>
         m.time.difference(q.time).abs().inSeconds < 120 &&
         haversineKm(m.lat, m.lon, q.lat, q.lon) < 60);

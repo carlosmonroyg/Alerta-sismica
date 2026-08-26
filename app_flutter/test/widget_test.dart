@@ -125,6 +125,61 @@ void main() {
     expect(merged.any((x) => x.id == 'usgs_1'), isFalse);
   });
 
+  test('dedup: Los Santos 2026-08-26, tal como lo sirvió el servidor', () {
+    // Datos REALES de /v1/sismos. Un solo sismo publicado por los tres
+    // catálogos con 1,4 s de diferencia y epicentros a 5-15 km entre sí. La
+    // app lo mostraba como tres sismos de M5.1, M5.3 y M4.9.
+    //
+    // La lista llega ordenada por TIEMPO (así responde el servidor), no por
+    // prioridad de fuente: es justo el caso que antes elegía mal al ganador.
+    Quake q(String id, String fuente, double mag, int ms, double la, double lo,
+            double prof) =>
+        Quake.at(
+          id: id,
+          mag: mag,
+          lat: la,
+          lon: lo,
+          depth: prof,
+          time: DateTime.fromMillisecondsSinceEpoch(ms),
+          place: 'Los Santos - Santander',
+          source: fuente,
+          userLat: 4.142,
+          userLon: -73.627,
+        );
+
+    final merged = dedupQuakes([
+      q('sgc_SGC2026quikpc', 'SGC', 5.1, 1787762716000, 6.8215, -73.114, 149),
+      q('emsc_20260826_0000228', 'EMSC', 5.3, 1787762715350, 6.6909, -73.0824,
+          157),
+      q('usgs_us7000tbzn', 'USGS', 4.9, 1787762714599, 6.737, -73.0596, 159.9),
+    ]);
+
+    expect(merged.length, 1, reason: 'es un solo sismo, no tres');
+    expect(merged.single.source, 'SGC', reason: 'la fuente oficial manda');
+    expect(merged.single.mag, 5.1);
+  });
+
+  test('dedup: el ganador no depende del orden de la lista', () {
+    final t = DateTime(2026, 8, 26, 14, 5, 0);
+    Quake q(String fuente, int desfaseS) => Quake.at(
+          id: fuente,
+          mag: 5.0,
+          lat: 6.8,
+          lon: -73.1,
+          depth: 150,
+          time: t.add(Duration(seconds: desfaseS)),
+          place: 'x',
+          source: fuente,
+          userLat: 4.142,
+          userLon: -73.627,
+        );
+
+    // El EMSC va primero Y es el más reciente: aun así debe ganar el SGC.
+    final merged = dedupQuakes([q('EMSC', 40), q('USGS', 20), q('SGC', 0)]);
+    expect(merged.length, 1);
+    expect(merged.single.source, 'SGC');
+  });
+
   test('STA/LTA: no dispara con ruido de fondo', () {
     final s = Sim();
     final rnd = math.Random(7);
