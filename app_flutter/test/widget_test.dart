@@ -159,6 +159,50 @@ void main() {
     expect(merged.single.mag, 5.1);
   });
 
+  test('borde del radio: un M5.1 no se pierde porque el SGC lo situara 3 km '
+      'más lejos', () {
+    // Caso real. Desde Villavicencio, el sismo de Los Santos quedó a 290 km
+    // según el EMSC, 295 km según el USGS y 303 km según el SGC. Con el radio
+    // en 300 km, la solución oficial caía fuera y el usuario veía el M4.9 del
+    // USGS en vez del M5.1 del SGC.
+    Quake q(String fuente, double mag, double la, double lo, int ms) =>
+        Quake.at(
+          id: fuente,
+          mag: mag,
+          lat: la,
+          lon: lo,
+          depth: 150,
+          time: DateTime.fromMillisecondsSinceEpoch(ms),
+          place: 'Los Santos',
+          source: fuente,
+          userLat: 4.1420,
+          userLon: -73.6266,
+        );
+
+    final merged = dedupQuakes([
+      q('SGC', 5.1, 6.8215, -73.114, 1787762716000),
+      q('EMSC', 5.3, 6.6909, -73.0824, 1787762715350),
+      q('USGS', 4.9, 6.737, -73.0596, 1787762714599),
+    ]);
+
+    expect(merged.length, 1);
+    final e = merged.single;
+    expect(e.source, 'SGC', reason: 'se muestran los datos oficiales');
+    expect(e.mag, 5.1);
+    expect(e.dist, greaterThan(300), reason: 'el epicentro del SGC sí está fuera');
+    expect(e.distMin, lessThan(300),
+        reason: 'pero el del EMSC está dentro, y eso es lo que decide');
+
+    // Con radio 300 el sismo DEBE entrar, mostrando la magnitud del SGC.
+    expect(
+      sismoPasaElFiltro(e, minMag: 2.5, radioKm: 300),
+      isTrue,
+      reason: 'un M5.1 no puede desaparecer por 3 km de desacuerdo entre agencias',
+    );
+    // Y un radio realmente pequeño lo sigue dejando fuera.
+    expect(sismoPasaElFiltro(e, minMag: 2.5, radioKm: 100), isFalse);
+  });
+
   test('dedup: el ganador no depende del orden de la lista', () {
     final t = DateTime(2026, 8, 26, 14, 5, 0);
     Quake q(String fuente, int desfaseS) => Quake.at(

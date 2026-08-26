@@ -446,8 +446,21 @@ async function listarSismos(url, env) {
   let lista = dedupSismos(results ?? []);
   if (lat !== null && lon !== null) {
     lista = lista
-      .map((s) => ({ ...s, dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)) }))
-      .filter((s) => s.dist <= radio);
+      .map(({ soluciones, ...s }) => {
+        // El radio se decide con la solución MÁS CERCANA del grupo; los datos
+        // que se devuelven son los de la fuente prioritaria. Así el usuario ve
+        // la magnitud oficial y no se pierde un sismo porque el SGC situara el
+        // epicentro unos kilómetros más lejos que el EMSC.
+        const dists = soluciones.map((x) => haversineKm(lat, lon, x.lat, x.lon));
+        return {
+          ...s,
+          dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)),
+          distMin: Math.round(Math.min(...dists)),
+        };
+      })
+      .filter((s) => s.distMin <= radio);
+  } else {
+    lista = lista.map(({ soluciones, ...s }) => s);
   }
   return ok({ total: lista.length, sismos: lista });
 }
@@ -479,8 +492,15 @@ async function datosPanel(url, env, peticion) {
   // y sin fusionarlos el panel declaraba hasta el triple de sismos de los que
   // realmente ocurrieron.
   const cerca = dedupSismos(results ?? [])
-    .map((s) => ({ ...s, dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)) }))
-    .filter((s) => s.dist <= radio);
+    .map(({ soluciones, ...s }) => ({
+      ...s,
+      dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)),
+      // Igual que en /v1/sismos: dentro del radio si lo está cualquiera de
+      // las soluciones, para que un evento del borde no entre o salga según
+      // qué agencia lo publicó.
+      distMin: Math.min(...soluciones.map((x) => haversineKm(lat, lon, x.lat, x.lon))),
+    }))
+    .filter((s) => s.distMin <= radio);
 
   // Mismo recuento para los 30 días anteriores: da la variación del periodo.
   //
@@ -496,7 +516,9 @@ async function datosPanel(url, env, peticion) {
 
   const prev = {
     n: dedupSismos(filasPrev ?? []).filter(
-      (s) => haversineKm(lat, lon, s.lat, s.lon) <= radio
+      (s) =>
+        Math.min(...s.soluciones.map((x) => haversineKm(lat, lon, x.lat, x.lon))) <=
+        radio
     ).length,
   };
 

@@ -61,6 +61,18 @@ class Quake {
   /// Catálogo de origen: 'SGC', 'USGS' o 'EMSC'.
   final String source;
 
+  /// Distancia de la solución MÁS CERCANA de las que se fusionaron en este
+  /// evento. Normalmente es [dist]; difiere cuando varios catálogos publican
+  /// el mismo temblor con epicentros separados.
+  ///
+  /// Solo se usa para decidir si el sismo entra en el radio del usuario, y
+  /// existe porque ese radio no puede depender de qué agencia acertó a poner
+  /// el epicentro unos kilómetros más acá: el sismo de Los Santos del
+  /// 2026-08-26 lo situaron a 290 km (EMSC), 295 km (USGS) y 303 km (SGC), y
+  /// con el radio en 300 km el usuario recibía un M4.9 del USGS en vez del
+  /// M5.1 oficial, solo porque la solución del SGC caía 3 km fuera.
+  final double distMin;
+
   Quake({
     required this.id,
     required this.mag,
@@ -73,7 +85,27 @@ class Quake {
     required this.time,
     required this.place,
     required this.source,
-  });
+    double? distMin,
+  }) : distMin = distMin ?? dist;
+
+  /// Copia el sismo cambiando solo la distancia de la solución más cercana.
+  /// La usa la fusión de catálogos: los datos mostrados siguen siendo los de
+  /// la fuente prioritaria, pero el radio se decide con la solución más
+  /// cercana del grupo.
+  Quake conDistMin(double d) => Quake(
+        id: id,
+        mag: mag,
+        lat: lat,
+        lon: lon,
+        depth: depth,
+        dist: dist,
+        brg: brg,
+        felt: felt,
+        time: time,
+        place: place,
+        source: source,
+        distMin: d,
+      );
 
   /// Construye el sismo calculando distancia/rumbo/intensidad respecto al usuario.
   factory Quake.at({
@@ -87,6 +119,7 @@ class Quake {
     required String source,
     required double userLat,
     required double userLon,
+    double? distMin,
   }) {
     final dist = haversineKm(userLat, userLon, lat, lon);
     return Quake(
@@ -101,6 +134,7 @@ class Quake {
       time: time,
       place: place,
       source: source,
+      distMin: distMin,
     );
   }
 }
@@ -134,7 +168,10 @@ bool sismoPasaElFiltro(
 }) {
   if (emergencia) return true;
   if (q.mag < minMag) return false;
-  if (conUbicacion && q.dist > radioKm) return false;
+  // distMin y no dist: si CUALQUIERA de las soluciones fusionadas cae dentro
+  // del radio, el sismo entra. Un borde duro sobre un epicentro difuso no
+  // puede decidir si el usuario se entera de un M5.1.
+  if (conUbicacion && q.distMin > radioKm) return false;
   return true;
 }
 

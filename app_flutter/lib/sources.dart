@@ -98,10 +98,19 @@ List<Quake> dedupQuakes(List<Quake> all) {
 
   final merged = <Quake>[];
   for (final q in porPrioridad) {
-    final isDup = merged.any((m) =>
+    final i = merged.indexWhere((m) =>
         m.time.difference(q.time).abs().inSeconds < 120 &&
         haversineKm(m.lat, m.lon, q.lat, q.lon) < 60);
-    if (!isDup) merged.add(q);
+    if (i == -1) {
+      merged.add(q);
+      continue;
+    }
+    // Fusionar es quedarse con los datos de la fuente prioritaria, pero NO
+    // perder que otra agencia situó el epicentro más cerca: esa distancia es
+    // la que decide si el sismo entra en el radio del usuario.
+    if (q.dist < merged[i].distMin) {
+      merged[i] = merged[i].conDistMin(q.dist);
+    }
   }
   merged.sort((a, b) => b.time.compareTo(a.time));
   return merged;

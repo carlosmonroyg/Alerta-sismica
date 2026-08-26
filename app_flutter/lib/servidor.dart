@@ -121,7 +121,13 @@ class Servidor {
           // Defensa por si el servidor es de una versión anterior y no
           // entiende el parámetro `mag`: el filtro del usuario manda igual.
           .where((s) => ((s['mag'] as num?)?.toDouble() ?? 0) >= minMag)
+          // El servidor manda distMin: la distancia de la solución más
+          // cercana del grupo fusionado. Sin adoptarla, la app recalcularía
+          // la distancia desde el epicentro de la fuente prioritaria y
+          // volvería a descartar por radio justo lo que el servidor acababa
+          // de incluir.
           .map((s) => Quake.at(
+                distMin: (s['distMin'] as num?)?.toDouble(),
                 id: s['id'] as String,
                 mag: (s['mag'] as num).toDouble(),
                 lat: (s['lat'] as num).toDouble(),

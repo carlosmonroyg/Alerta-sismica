@@ -58,12 +58,17 @@ export function dedupSismos(lista) {
 
   const fusionados = [];
   for (const s of porPrioridad) {
-    const repetido = fusionados.some(
+    const grupo = fusionados.find(
       (m) =>
         Math.abs(m.ocurrio - s.ocurrio) < DEDUP_MS &&
         haversineKm(m.lat, m.lon, s.lat, s.lon) < DEDUP_KM
     );
-    if (!repetido) fusionados.push(s);
+    // Se conservan TODAS las soluciones del grupo, no solo la ganadora: el
+    // filtro por radio necesita la más cercana. Descartarlas aquí es lo que
+    // hacía desaparecer un M5.1 cuando la solución oficial caía 3 km fuera
+    // del radio y las otras dos caían dentro.
+    if (grupo) grupo.soluciones.push(s);
+    else fusionados.push({ ...s, soluciones: [s] });
   }
   return fusionados.sort((a, b) => b.ocurrio - a.ocurrio);
 }
