@@ -475,16 +475,30 @@ async function datosPanel(url, env, peticion) {
     " ORDER BY ocurrio DESC"
   ).bind(desde, ...caja).all();
 
-  const cerca = (results ?? [])
+  // Fusionar antes de contar: un mismo temblor lo publican SGC, USGS y EMSC,
+  // y sin fusionarlos el panel declaraba hasta el triple de sismos de los que
+  // realmente ocurrieron.
+  const cerca = dedupSismos(results ?? [])
     .map((s) => ({ ...s, dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)) }))
     .filter((s) => s.dist <= radio);
 
   // Mismo recuento para los 30 días anteriores: da la variación del periodo.
-  const prev = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM sismos" +
+  //
+  // Se traen las filas en vez de un COUNT porque hay que fusionarlas con el
+  // mismo criterio. Con un COUNT crudo el periodo anterior quedaría inflado
+  // frente al actual ya fusionado, y el panel anunciaría un desplome de la
+  // actividad sísmica que solo existe en la aritmética.
+  const { results: filasPrev } = await env.DB.prepare(
+    "SELECT id, fuente, mag, lat, lon, prof, lugar, ocurrio FROM sismos" +
     " WHERE ocurrio > ?1 AND ocurrio <= ?2 AND fuente <> 'COMUNIDAD'" +
     " AND lat BETWEEN ?3 AND ?4 AND lon BETWEEN ?5 AND ?6"
-  ).bind(desdeAnterior, desde, ...caja).first();
+  ).bind(desdeAnterior, desde, ...caja).all();
+
+  const prev = {
+    n: dedupSismos(filasPrev ?? []).filter(
+      (s) => haversineKm(lat, lon, s.lat, s.lon) <= radio
+    ).length,
+  };
 
   const porDia = {};
   for (const s of cerca) {
