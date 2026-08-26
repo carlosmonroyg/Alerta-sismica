@@ -9,6 +9,7 @@ import { FUENTES, diagnosticar, diagnosticarSgc } from "./fuentes.js";
 import { enviarAZonas, enviarADispositivos } from "./fcm.js";
 import {
   celdaDe, zonaDe, zonasEnRadio, haversineKm, intensidad, centroDeCelda,
+  dedupSismos,
 } from "./geo.js";
 
 const JSON_H = { "Content-Type": "application/json; charset=utf-8" };
@@ -439,7 +440,10 @@ async function listarSismos(url, env) {
     " ORDER BY ocurrio DESC LIMIT 500"
   ).bind(desde, magMin).all();
 
-  let lista = results ?? [];
+  // Fusionar ANTES de filtrar por radio: si se hiciera al revés y la solución
+  // del SGC quedara justo fuera del radio mientras la del EMSC entra, el
+  // evento reaparecería con la magnitud de la fuente menos prioritaria.
+  let lista = dedupSismos(results ?? []);
   if (lat !== null && lon !== null) {
     lista = lista
       .map((s) => ({ ...s, dist: Math.round(haversineKm(lat, lon, s.lat, s.lon)) }))

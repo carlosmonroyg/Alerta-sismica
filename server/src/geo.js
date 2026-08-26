@@ -23,6 +23,51 @@ export function intensidad(mag, distKm) {
   return 1.5 * mag - 3.0 * Math.log10(Math.max(distKm, 5) + 10) + 3.0;
 }
 
+/** Prioridad de catálogos al fusionar: gana el primero de la lista. */
+export const PRIORIDAD_FUENTE = ["SGC", "USGS", "EMSC"];
+
+/** Mismo evento si ocurre a menos de 120 s y 60 km de otro ya aceptado. */
+const DEDUP_MS = 120000;
+const DEDUP_KM = 60;
+
+/**
+ * Fusiona el mismo sismo publicado por varios catálogos.
+ *
+ * Un evento aparece en SGC, USGS y EMSC con segundos de diferencia y
+ * soluciones ligeramente distintas: el sismo de Los Santos del 2026-08-26
+ * llegó como M5.1/149 km (SGC), M5.3/157 km (EMSC) y M4.9/160 km (USGS), con
+ * epicentros separados entre 5 y 15 km. Sin fusionarlos la app muestra TRES
+ * sismos y tres magnitudes para un solo temblor.
+ *
+ * Gana la fuente de mayor prioridad, no la más reciente: el SGC es el
+ * organismo oficial de Colombia y publica soluciones revisadas por analista.
+ * Es la misma regla que aplica la app en dedupQuakes() (sources.dart); si se
+ * cambia aquí hay que cambiarla allá, o el teléfono y el servidor discreparán
+ * sobre cuántos sismos hubo.
+ */
+export function dedupSismos(lista) {
+  const rango = (f) => {
+    const i = PRIORIDAD_FUENTE.indexOf(f);
+    return i === -1 ? PRIORIDAD_FUENTE.length : i;
+  };
+  // Ordenar por prioridad ANTES de recorrer: el primero que se acepta de cada
+  // grupo es el que se queda, así que el orden decide quién gana.
+  const porPrioridad = [...lista].sort(
+    (a, b) => rango(a.fuente) - rango(b.fuente) || b.ocurrio - a.ocurrio
+  );
+
+  const fusionados = [];
+  for (const s of porPrioridad) {
+    const repetido = fusionados.some(
+      (m) =>
+        Math.abs(m.ocurrio - s.ocurrio) < DEDUP_MS &&
+        haversineKm(m.lat, m.lon, s.lat, s.lon) < DEDUP_KM
+    );
+    if (!repetido) fusionados.push(s);
+  }
+  return fusionados.sort((a, b) => b.ocurrio - a.ocurrio);
+}
+
 export const GRADO_CELDA = 0.25;
 export const GRADO_ZONA = 1.0;
 
