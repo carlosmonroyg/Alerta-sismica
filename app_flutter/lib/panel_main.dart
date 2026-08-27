@@ -864,8 +864,21 @@ class _PanelPageState extends State<PanelPage> {
       item(Container(width: 18, height: 2, color: _faultP), 'Falla activa'),
       titulo('Referencia'),
       item(punto(_accentP), 'Casco urbano'),
-      const Text('Anillos cada 100 km',
-          style: TextStyle(fontSize: 12.5, color: _mutedP)),
+      item(
+          Container(width: 9, height: 9, color: _ink2.withValues(alpha: .55)),
+          'Ciudad principal'),
+      item(
+          Container(
+            width: 18,
+            height: 10,
+            decoration: BoxDecoration(
+              color: _accentP.withValues(alpha: .10),
+              border: Border.all(color: _accentP.withValues(alpha: .75)),
+            ),
+          ),
+          'Radio de análisis'),
+      Text('Anillos cada ${_pasoAnillo(radioVista).round()} km',
+          style: const TextStyle(fontSize: 12.5, color: _mutedP)),
     ]);
   }
 
@@ -1094,6 +1107,46 @@ class BarrasDiarias extends CustomPainter {
 
 
 // ---------------- Mapa de epicentros y fallas ----------------
+/// Separación entre anillos de referencia, según el radio elegido.
+///
+/// Vive fuera del pintor porque la leyenda anuncia este mismo número: si cada
+/// uno lo calculara por su cuenta, acabarían discrepando.
+double _pasoAnillo(double radio) => radio <= 120
+    ? 25
+    : radio <= 250
+        ? 50
+        : 100;
+
+/// Ciudades de referencia para poder situarse en el mapa.
+///
+/// Sin ellas el panel es un diagrama abstracto: trazas de falla y puntos sobre
+/// un fondo vacío. Con ellas, quien lo ve en un consejo municipal reconoce
+/// dónde está mirando.
+///
+/// `nivel` 1 se rotula siempre; el 2 solo si su etiqueta cabe sin pisar otra
+/// —el Eje Cafetero tiene tres capitales a menos de 60 km y sus nombres se
+/// solapan a cualquier escala.
+const _ciudades = <({String nombre, double lat, double lon, int nivel})>[
+  (nombre: 'Bogotá', lat: 4.711, lon: -74.072, nivel: 1),
+  (nombre: 'Medellín', lat: 6.244, lon: -75.581, nivel: 1),
+  (nombre: 'Cali', lat: 3.452, lon: -76.532, nivel: 1),
+  (nombre: 'Bucaramanga', lat: 7.119, lon: -73.123, nivel: 1),
+  (nombre: 'Villavicencio', lat: 4.142, lon: -73.627, nivel: 1),
+  (nombre: 'Ibagué', lat: 4.439, lon: -75.232, nivel: 2),
+  (nombre: 'Neiva', lat: 2.927, lon: -75.289, nivel: 2),
+  (nombre: 'Pereira', lat: 4.813, lon: -75.696, nivel: 2),
+  (nombre: 'Manizales', lat: 5.070, lon: -75.517, nivel: 2),
+  (nombre: 'Armenia', lat: 4.534, lon: -75.681, nivel: 2),
+  (nombre: 'Tunja', lat: 5.535, lon: -73.368, nivel: 2),
+  (nombre: 'Popayán', lat: 2.444, lon: -76.614, nivel: 2),
+  (nombre: 'Florencia', lat: 1.614, lon: -75.607, nivel: 2),
+  (nombre: 'Yopal', lat: 5.338, lon: -72.395, nivel: 2),
+  (nombre: 'Quibdó', lat: 5.692, lon: -76.658, nivel: 2),
+  (nombre: 'Sogamoso', lat: 5.714, lon: -72.933, nivel: 2),
+  (nombre: 'Granada', lat: 3.546, lon: -73.708, nivel: 2),
+  (nombre: 'San José del Guaviare', lat: 2.572, lon: -72.641, nivel: 2),
+];
+
 class MapaSismico extends CustomPainter {
   final List<Quake> sismos;
   final List<List<List<double>>> fallas;
@@ -1125,14 +1178,30 @@ class MapaSismico extends CustomPainter {
 
     final cx = px(municipio.lon), cy = py(municipio.lat);
 
+    // Retícula de coordenadas. Va debajo de todo y muy tenue: su trabajo es
+    // dar escala y orientación, no competir con los datos.
+    final malla = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = _lineSoft;
+    for (var lon = lonMin.ceil(); lon <= lonMax.floor(); lon++) {
+      final x = px(lon.toDouble());
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), malla);
+      _texto(canvas, '${lon.abs()}°O', Offset(x + 3, size.height - 14),
+          _mutedP.withValues(alpha: .55), 9, ancho: 34);
+    }
+    for (var lat = latMin.ceil(); lat <= latMax.floor(); lat++) {
+      final y = py(lat.toDouble());
+      if (y < 0 || y > size.height) continue;
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), malla);
+      _texto(canvas, '$lat°N', Offset(4, y + 3),
+          _mutedP.withValues(alpha: .55), 9, ancho: 30);
+    }
+
     // Anillos de referencia. El paso se adapta al radio elegido: con 500 km
     // tres anillos fijos de 100/200/300 dejaban vacía la mitad del mapa, y
     // con 50 km no se distinguía ninguno.
-    final paso = radio <= 120
-        ? 25.0
-        : radio <= 250
-            ? 50.0
-            : 100.0;
+    final paso = _pasoAnillo(radio);
     final anillo = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
@@ -1173,6 +1242,35 @@ class MapaSismico extends CustomPainter {
         path.lineTo(px(f[i][0]), py(f[i][1]));
       }
       canvas.drawPath(path, trazo);
+    }
+
+    // Ciudades de referencia.
+    //
+    // El rótulo del propio municipio se reserva primero para que ninguna
+    // ciudad se lo pise: es el punto que el usuario vino a mirar.
+    final ocupado = <Rect>[
+      Rect.fromLTWH(cx + 10, cy - 10, municipio.nombre.length * 6.6 + 8, 16),
+    ];
+    final orden3 = [..._ciudades]..sort((a, b) => a.nivel.compareTo(b.nivel));
+    for (final c in orden3) {
+      final x = px(c.lon), y = py(c.lat);
+      if (x < 2 || x > size.width - 2 || y < 2 || y > size.height - 2) continue;
+      // No repetir el municipio si ya está dibujado como casco urbano.
+      if ((x - cx).abs() < 6 && (y - cy).abs() < 6) continue;
+
+      canvas.drawRect(Rect.fromCenter(center: Offset(x, y), width: 4.5, height: 4.5),
+          Paint()..color = _ink2.withValues(alpha: .55));
+
+      final caja = Rect.fromLTWH(x + 5, y - 6, c.nombre.length * 5.4 + 4, 12);
+      final choca = ocupado.any((r) => r.overlaps(caja));
+      // El nivel 1 se rotula aunque choque: son las capitales que dan la
+      // orientación general y sin ellas el mapa vuelve a ser abstracto.
+      if (c.nivel > 1 && choca) continue;
+      if (caja.right > size.width) continue;
+
+      _texto(canvas, c.nombre, Offset(x + 5, y - 6),
+          _ink2.withValues(alpha: .8), 9.5, ancho: 120, mono: false);
+      ocupado.add(caja);
     }
 
     // Epicentros: los más antiguos primero
@@ -1226,14 +1324,17 @@ class MapaSismico extends CustomPainter {
 void _texto(Canvas canvas, String s, Offset pos, Color color, double tam,
     {double ancho = 80,
     TextAlign alineado = TextAlign.left,
-    bool negrita = false}) {
+    bool negrita = false,
+    // Las cifras van en monoespaciada para que alineen; los topónimos no,
+    // que ahí solo estorba a la lectura.
+    bool mono = true}) {
   final tp = TextPainter(
     text: TextSpan(
       text: s,
       style: TextStyle(
         color: color,
         fontSize: tam,
-        fontFamily: _mono,
+        fontFamily: mono ? _mono : null,
         fontWeight: negrita ? FontWeight.w700 : FontWeight.w400,
       ),
     ),
