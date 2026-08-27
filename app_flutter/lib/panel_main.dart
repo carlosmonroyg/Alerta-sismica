@@ -222,7 +222,20 @@ class PanelPage extends StatefulWidget {
 class _PanelPageState extends State<PanelPage> {
   DatosPanel? datos;
   bool enLinea = false;
+
+  /// Radio con el que se pidieron los datos que se están mostrando.
   double radio = 350;
+
+  /// Radio que el usuario está arrastrando ahora mismo. Se separa de [radio]
+  /// para que el círculo del mapa siga al dedo sin lanzar una petición por
+  /// cada píxel: los datos se recargan al soltar.
+  double? radioArrastre;
+
+  /// El que manda para dibujar.
+  double get radioVista => radioArrastre ?? radio;
+
+  static const radioMin = 50.0, radioMax = 500.0;
+
   List<List<List<double>>> fallas = const [];
 
   @override
@@ -386,7 +399,11 @@ class _PanelPageState extends State<PanelPage> {
   Widget _contenido() {
     final d = datos!;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _tituloSeccion('Situación del municipio', filtro: true),
+      // El control va arriba del todo y a lo ancho: no filtra solo el mapa,
+      // determina todas las cifras que siguen.
+      const SizedBox(height: 20),
+      _controlRadio(),
+      _tituloSeccion('Situación del municipio'),
       _rejilla([
         _kpi(
             'Sismos en 30 días',
@@ -476,6 +493,7 @@ class _PanelPageState extends State<PanelPage> {
                 sismos: d.lista,
                 fallas: fallas,
                 municipio: widget.municipio,
+                radio: radioVista,
               ),
               size: Size.infinite,
             ),
@@ -500,65 +518,161 @@ class _PanelPageState extends State<PanelPage> {
     ]);
   }
 
-  Widget _tituloSeccion(String texto, {bool filtro = false, String? nota}) {
+  /// Encabezado de sección: rótulo a la izquierda y una regla fina que ocupa
+  /// el resto del ancho. La regla no decora — separa bloques sin necesidad de
+  /// encajonar cada uno en su tarjeta, que es lo que recargaba la vista.
+  Widget _tituloSeccion(String texto, {String? nota}) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(0, 30, 0, 12),
-      child: Row(children: [
+      padding: const EdgeInsets.fromLTRB(0, 34, 0, 14),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
         Text(texto.toUpperCase(),
             style: const TextStyle(
-                fontSize: 13,
+                fontSize: 11.5,
                 fontWeight: FontWeight.w700,
-                letterSpacing: 1.2,
-                color: _mutedP)),
+                letterSpacing: 1.4,
+                color: _ink2)),
         if (nota != null) ...[
           const SizedBox(width: 12),
-          Text(nota, style: const TextStyle(fontSize: 12, color: _mutedP)),
+          Flexible(
+            child: Text(nota,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 12, color: _mutedP)),
+          ),
         ],
-        const Spacer(),
-        if (filtro) _filtroRadio(),
+        const SizedBox(width: 16),
+        const Expanded(child: Divider(height: 1, thickness: 1, color: _lineSoft)),
       ]),
     );
   }
 
-  Widget _filtroRadio() {
-    return Row(children: [
-      const Text('RADIO',
-          style: TextStyle(
-              fontSize: 11, letterSpacing: 1, color: _mutedP)),
-      const SizedBox(width: 8),
-      for (final r in [100.0, 200.0, 350.0])
-        Padding(
-          padding: const EdgeInsets.only(left: 6),
-          child: _botonRadio(r),
-        ),
-    ]);
+  /// Control del radio de análisis.
+  ///
+  /// Sustituye a tres botones fijos (100/200/350 km) que obligaban a elegir
+  /// entre saltos arbitrarios. Con el deslizador el círculo del mapa sigue al
+  /// dedo en tiempo real y los datos se recargan al soltar, no en cada píxel.
+  Widget _controlRadio() {
+    final r = radioVista;
+    // Área realmente cubierta. Es el dato que hace entender por qué pasar de
+    // 300 a 400 km no es "un poco más": la superficie crece al cuadrado.
+    final area = math.pi * r * r;
+    final arrastrando = radioArrastre != null;
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+      decoration: BoxDecoration(
+        color: _surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _lineSoft),
+      ),
+      child: LayoutBuilder(builder: (context, c) {
+        final angosto = c.maxWidth < 620;
+        final lectura = Row(
+          crossAxisAlignment: CrossAxisAlignment.baseline,
+          textBaseline: TextBaseline.alphabetic,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${r.round()}',
+                style: TextStyle(
+                    fontFamily: _mono,
+                    fontSize: 38,
+                    height: 1,
+                    fontWeight: FontWeight.w700,
+                    color: arrastrando ? _accentP : _ink)),
+            const SizedBox(width: 4),
+            const Text('km',
+                style: TextStyle(
+                    fontSize: 15, color: _mutedP, fontWeight: FontWeight.w600)),
+          ],
+        );
+
+        final etiquetas = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('RADIO DE ANÁLISIS',
+                style: TextStyle(
+                    fontSize: 10.5,
+                    letterSpacing: 1.1,
+                    fontWeight: FontWeight.w600,
+                    color: _mutedP)),
+            const SizedBox(height: 6),
+            lectura,
+            const SizedBox(height: 4),
+            Text('${_miles(area.round())} km² cubiertos',
+                style: const TextStyle(fontSize: 11.5, color: _mutedP)),
+          ],
+        );
+
+        final deslizador = Column(children: [
+          SliderTheme(
+            data: SliderThemeData(
+              trackHeight: 4,
+              activeTrackColor: _accentP,
+              inactiveTrackColor: _lineP,
+              thumbColor: _surface,
+              overlayColor: _accentP.withValues(alpha: .12),
+              activeTickMarkColor: _accentP.withValues(alpha: .45),
+              inactiveTickMarkColor: _lineP,
+              valueIndicatorColor: _ink,
+              trackShape: const RoundedRectSliderTrackShape(),
+              thumbShape: const _AnilloThumb(),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 20),
+              showValueIndicator: ShowValueIndicator.never,
+            ),
+            child: Slider(
+              value: r.clamp(radioMin, radioMax),
+              min: radioMin,
+              max: radioMax,
+              divisions: ((radioMax - radioMin) / 10).round(),
+              onChanged: (v) => setState(() => radioArrastre = v),
+              onChangeEnd: (v) {
+                setState(() {
+                  radio = v;
+                  radioArrastre = null;
+                });
+                _cargar();
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                for (final m in [50, 200, 350, 500])
+                  Text('$m',
+                      style: const TextStyle(
+                          fontFamily: _mono, fontSize: 10.5, color: _mutedP)),
+              ],
+            ),
+          ),
+        ]);
+
+        if (angosto) {
+          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            etiquetas,
+            const SizedBox(height: 4),
+            deslizador,
+          ]);
+        }
+        return Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+          SizedBox(width: 190, child: etiquetas),
+          const SizedBox(width: 24),
+          Expanded(child: deslizador),
+        ]);
+      }),
+    );
   }
 
-  Widget _botonRadio(double r) {
-    final activo = radio == r;
-    return Material(
-      color: activo ? _accentP : _surface,
-      borderRadius: BorderRadius.circular(8),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        onTap: () {
-          setState(() => radio = r);
-          _cargar();
-        },
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: activo ? _accentP : _lineP),
-          ),
-          child: Text('${r.round()} km',
-              style: TextStyle(
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w600,
-                  color: activo ? _surface : _ink2)),
-        ),
-      ),
-    );
+  /// 1234567 -> 1.234.567 (separador de miles en español).
+  static String _miles(int n) {
+    final s = n.toString();
+    final b = StringBuffer();
+    for (var i = 0; i < s.length; i++) {
+      if (i > 0 && (s.length - i) % 3 == 0) b.write('.');
+      b.write(s[i]);
+    }
+    return b.toString();
   }
 
   Widget _rejilla(List<Widget> hijos) {
@@ -574,43 +688,49 @@ class _PanelPageState extends State<PanelPage> {
     });
   }
 
+  /// Indicador. Sin borde: la cifra es lo que debe leerse desde el fondo de
+  /// una sala de reuniones, y encajonar cada dato en una caja con marco hacía
+  /// competir el contenedor con el contenido.
   Widget _kpi(String etiqueta, String valor, String sub, {String? unidad}) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
       decoration: BoxDecoration(
         color: _surface,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: _lineP),
+        borderRadius: BorderRadius.circular(14),
       ),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text(etiqueta.toUpperCase(),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
-                fontSize: 10.5,
-                letterSpacing: .9,
+                fontSize: 10,
+                letterSpacing: 1.05,
                 color: _mutedP,
                 fontWeight: FontWeight.w600)),
-        const SizedBox(height: 8),
+        const SizedBox(height: 12),
         Row(crossAxisAlignment: CrossAxisAlignment.baseline,
             textBaseline: TextBaseline.alphabetic,
             children: [
               Text(valor,
                   style: const TextStyle(
                       fontFamily: _mono,
-                      fontSize: 30,
-                      height: 1.05,
-                      fontWeight: FontWeight.w700)),
+                      fontSize: 34,
+                      height: 1,
+                      letterSpacing: -1,
+                      fontWeight: FontWeight.w700,
+                      color: _ink)),
               if (unidad != null) ...[
-                const SizedBox(width: 3),
+                const SizedBox(width: 4),
                 Text(unidad,
                     style: const TextStyle(
                         fontSize: 14, color: _mutedP, fontWeight: FontWeight.w600)),
               ],
             ]),
-        const SizedBox(height: 6),
+        const SizedBox(height: 8),
         Text(sub,
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12, color: _mutedP)),
+            style: const TextStyle(fontSize: 11.5, height: 1.35, color: _mutedP)),
       ]),
     );
   }
@@ -846,7 +966,7 @@ class _PanelPageState extends State<PanelPage> {
         ])),
         const SizedBox(height: 8),
         const Text(
-            'Alerta Sísmica CO · Carlos Eduardo Monroy Guzmán (CEMG) · 311 448 6732',
+            'Alerta Sísmica CO · Carlos Eduardo Monroy Guzmán (CEMG) 📧 carlosmonroyeg91@gmail.com · ',
             style: estilo),
       ]),
     );
@@ -865,6 +985,47 @@ class _PanelPageState extends State<PanelPage> {
 
   static String _hora(DateTime d) =>
       '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+}
+
+/// Pulgar del deslizador: un anillo, no un disco.
+///
+/// El disco macizo por omisión tapa la marca donde está posado y obliga a
+/// soltar para leer el valor. El anillo deja ver la pista por debajo, que es
+/// justo lo que se está ajustando.
+class _AnilloThumb extends SliderComponentShape {
+  const _AnilloThumb();
+
+  static const _r = 11.0;
+
+  @override
+  Size getPreferredSize(bool enabled, bool isDiscrete) =>
+      const Size.fromRadius(_r);
+
+  @override
+  void paint(PaintingContext context, Offset centro,
+      {required Animation<double> activationAnimation,
+      required Animation<double> enableAnimation,
+      required bool isDiscrete,
+      required TextPainter labelPainter,
+      required RenderBox parentBox,
+      required SliderThemeData sliderTheme,
+      required TextDirection textDirection,
+      required double value,
+      required double textScaleFactor,
+      required Size sizeWithOverflow}) {
+    final canvas = context.canvas;
+    // Sombra suave para despegarlo de la pista.
+    canvas.drawCircle(centro.translate(0, 1), _r,
+        Paint()..color = _ink.withValues(alpha: .10));
+    canvas.drawCircle(centro, _r, Paint()..color = sliderTheme.thumbColor!);
+    canvas.drawCircle(
+        centro,
+        _r - 1.25,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5
+          ..color = sliderTheme.activeTrackColor!);
+  }
 }
 
 // ---------------- Gráfica: sismos por día ----------------
@@ -938,10 +1099,15 @@ class MapaSismico extends CustomPainter {
   final List<List<List<double>>> fallas;
   final Municipio municipio;
 
+  /// Radio de análisis en km. Se dibuja resaltado sobre los anillos de
+  /// referencia, y sigue al deslizador mientras se arrastra.
+  final double radio;
+
   MapaSismico({
     required this.sismos,
     required this.fallas,
     required this.municipio,
+    required this.radio,
   });
 
   static const latMin = 0.9, latMax = 7.4, lonMin = -77.0, lonMax = -70.2;
@@ -959,17 +1125,40 @@ class MapaSismico extends CustomPainter {
 
     final cx = px(municipio.lon), cy = py(municipio.lat);
 
-    // Anillos de distancia
+    // Anillos de referencia. El paso se adapta al radio elegido: con 500 km
+    // tres anillos fijos de 100/200/300 dejaban vacía la mitad del mapa, y
+    // con 50 km no se distinguía ninguno.
+    final paso = radio <= 120
+        ? 25.0
+        : radio <= 250
+            ? 50.0
+            : 100.0;
     final anillo = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = _lineP;
-    for (final km in [100, 200, 300]) {
+    for (var km = paso; km < radio - paso * .35; km += paso) {
       final r = km * kmPx;
       _circuloPunteado(canvas, Offset(cx, cy), r, anillo);
-      _texto(canvas, '$km km', Offset(cx - 20, cy - r + 4), _mutedP, 11,
-          ancho: 40, alineado: TextAlign.center);
+      _texto(canvas, '${km.round()} km', Offset(cx - 22, cy - r + 4), _mutedP, 10.5,
+          ancho: 44, alineado: TextAlign.center);
     }
+
+    // El radio de análisis, resaltado: relleno tenue y borde continuo. Es el
+    // límite que decide qué entra en TODAS las cifras del panel, así que se
+    // distingue de los anillos de referencia, que solo sirven para medir.
+    final rSel = radio * kmPx;
+    canvas.drawCircle(Offset(cx, cy), rSel,
+        Paint()..color = _accentP.withValues(alpha: .055));
+    canvas.drawCircle(
+        Offset(cx, cy),
+        rSel,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.6
+          ..color = _accentP.withValues(alpha: .75));
+    _texto(canvas, '${radio.round()} km', Offset(cx - 30, cy - rSel - 16),
+        _accentP, 11.5, ancho: 60, alineado: TextAlign.center, negrita: true);
 
     // Fallas activas
     final trazo = Paint()
@@ -1027,7 +1216,10 @@ class MapaSismico extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant MapaSismico old) =>
-      old.sismos != sismos || old.fallas != fallas;
+      // El radio va primero: es lo que cambia en cada fotograma mientras se
+      // arrastra el deslizador. Sin comparar esto, el círculo se quedaría
+      // congelado hasta que llegaran datos nuevos del servidor.
+      old.radio != radio || old.sismos != sismos || old.fallas != fallas;
 }
 
 /// Dibuja texto en un Canvas (utilidad compartida por las gráficas).
