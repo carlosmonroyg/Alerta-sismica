@@ -1583,7 +1583,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                     const SizedBox(height: 2),
                     const Text(
-                      '📞 311 448 6732',
+                      '📧 carlosmonroyeg91@gmail.com',
                       style: TextStyle(fontSize: 12, color: kMuted),
                     ),
                     const SizedBox(height: 2),
