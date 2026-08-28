@@ -57,7 +57,7 @@ class Servidor {
                 'token': tokenFcm,
                 'lat': difusa(lat),
                 'lon': difusa(lon),
-                'radioKm': radioKm,
+                'radioKm': radioKm,               
                 'minMag': minMag,
                 'municipio': municipio,
               }))
