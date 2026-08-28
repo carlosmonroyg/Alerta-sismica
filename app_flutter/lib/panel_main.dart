@@ -1163,34 +1163,52 @@ class MapaSismico extends CustomPainter {
     required this.radio,
   });
 
-  static const latMin = 0.9, latMax = 7.4, lonMin = -77.0, lonMax = -70.2;
-
   @override
   void paint(Canvas canvas, Size size) {
     // Sin recorte, las trazas de falla que salen del recuadro se dibujarían
     // encima del resto del panel.
     canvas.clipRect(Offset.zero & size);
-    final kx = size.width / (lonMax - lonMin);
-    final ky = kx / math.cos(4.15 * math.pi / 180);
-    double px(double lon) => (lon - lonMin) * kx;
-    double py(double lat) => (latMax - lat) * ky;
-    final kmPx = ky / 111;
 
-    final cx = px(municipio.lon), cy = py(municipio.lat);
+    // ENCUADRE ADAPTATIVO. Antes el recuadro era fijo (0,9°–7,4°N y
+    // 77°–70,2°O) y no dependía del radio: con 500 km el círculo era más
+    // ancho que el mapa y solo se veían cuatro arcos cortando las esquinas,
+    // mientras que los sismos del área cubierta que caían fuera de esos
+    // límites entraban en las cifras pero no se dibujaban en ninguna parte.
+    //
+    // Ahora el municipio va al centro y la escala se calcula para que el
+    // círculo del radio quepa entero, con margen. Como efecto secundario, el
+    // panel deja de estar atado al Piedemonte: sirve igual para un municipio
+    // de Nariño o del Caribe.
+    final cx = size.width / 2, cy = size.height / 2;
+    final kmPx = math.min(size.width, size.height) / (2 * radio * 1.16);
+
+    final cosLat = math.cos(municipio.lat * math.pi / 180);
+    double px(double lon) => cx + (lon - municipio.lon) * 111 * cosLat * kmPx;
+    double py(double lat) => cy - (lat - municipio.lat) * 111 * kmPx;
+
+    // Límites realmente visibles, derivados de la escala.
+    final dLat = (size.height / 2) / (111 * kmPx);
+    final dLon = (size.width / 2) / (111 * cosLat * kmPx);
+    final latMin = municipio.lat - dLat, latMax = municipio.lat + dLat;
+    final lonMin = municipio.lon - dLon, lonMax = municipio.lon + dLon;
 
     // Retícula de coordenadas. Va debajo de todo y muy tenue: su trabajo es
-    // dar escala y orientación, no competir con los datos.
+    // dar escala y orientación, no competir con los datos. El paso crece con
+    // el área visible para que no se convierta en un cuadriculado denso.
+    final pasoGrado = dLon > 6 ? 2 : 1;
     final malla = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
       ..color = _lineSoft;
     for (var lon = lonMin.ceil(); lon <= lonMax.floor(); lon++) {
+      if (lon % pasoGrado != 0) continue;
       final x = px(lon.toDouble());
       canvas.drawLine(Offset(x, 0), Offset(x, size.height), malla);
       _texto(canvas, '${lon.abs()}°O', Offset(x + 3, size.height - 14),
           _mutedP.withValues(alpha: .55), 9, ancho: 34);
     }
     for (var lat = latMin.ceil(); lat <= latMax.floor(); lat++) {
+      if (lat % pasoGrado != 0) continue;
       final y = py(lat.toDouble());
       if (y < 0 || y > size.height) continue;
       canvas.drawLine(Offset(0, y), Offset(size.width, y), malla);
@@ -1209,8 +1227,10 @@ class MapaSismico extends CustomPainter {
     for (var km = paso; km < radio - paso * .35; km += paso) {
       final r = km * kmPx;
       _circuloPunteado(canvas, Offset(cx, cy), r, anillo);
-      _texto(canvas, '${km.round()} km', Offset(cx - 22, cy - r + 4), _mutedP, 10.5,
-          ancho: 44, alineado: TextAlign.center);
+      // Los rótulos van sobre un fondo del color del papel: en la captura del
+      // panel quedaban ilegibles porque las trazas de falla cruzan justo por
+      // encima del centro, que es donde se apilan todos.
+      _rotulo(canvas, '${km.round()} km', Offset(cx, cy - r), _mutedP);
     }
 
     // El radio de análisis, resaltado: relleno tenue y borde continuo. Es el
@@ -1226,8 +1246,8 @@ class MapaSismico extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.6
           ..color = _accentP.withValues(alpha: .75));
-    _texto(canvas, '${radio.round()} km', Offset(cx - 30, cy - rSel - 16),
-        _accentP, 11.5, ancho: 60, alineado: TextAlign.center, negrita: true);
+    _rotulo(canvas, '${radio.round()} km', Offset(cx, cy - rSel), _accentP,
+        negrita: true, tam: 11.5);
 
     // Fallas activas
     final trazo = Paint()
@@ -1318,6 +1338,33 @@ class MapaSismico extends CustomPainter {
       // arrastra el deslizador. Sin comparar esto, el círculo se quedaría
       // congelado hasta que llegaran datos nuevos del servidor.
       old.radio != radio || old.sismos != sismos || old.fallas != fallas;
+}
+
+/// Rótulo centrado en [centro], sobre un recuadro del color del papel.
+///
+/// El fondo no es decoración: sin él, los números de los anillos caen justo
+/// sobre las trazas de falla —que cruzan el centro del mapa— y no hay forma
+/// de leerlos.
+void _rotulo(Canvas canvas, String s, Offset centro, Color color,
+    {double tam = 10.5, bool negrita = false}) {
+  final tp = TextPainter(
+    text: TextSpan(
+      text: s,
+      style: TextStyle(
+        color: color,
+        fontSize: tam,
+        fontFamily: _mono,
+        fontWeight: negrita ? FontWeight.w700 : FontWeight.w500,
+      ),
+    ),
+    textDirection: TextDirection.ltr,
+  )..layout();
+  final caja = Rect.fromCenter(
+      center: centro, width: tp.width + 8, height: tp.height + 3);
+  canvas.drawRRect(
+      RRect.fromRectAndRadius(caja, const Radius.circular(3)),
+      Paint()..color = _surface.withValues(alpha: .88));
+  tp.paint(canvas, Offset(caja.left + 4, caja.top + 1.5));
 }
 
 /// Dibuja texto en un Canvas (utilidad compartida por las gráficas).
